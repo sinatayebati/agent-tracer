@@ -21,6 +21,7 @@ from tau2.data_model.tasks import EnvFunctionCall, InitializationData, Task
 from tau2.environment.environment import Environment, EnvironmentInfo
 from tau2.user.base import BaseUser, is_valid_user_history_message
 from tau2.user.user_simulator import DummyUser, UserSimulator, UserState
+from tau2.metrics.uncertainty import get_uncertainty_stats
 from tau2.utils.llm_utils import get_cost
 from tau2.utils.utils import format_time, get_now
 
@@ -53,6 +54,7 @@ class Orchestrator:
         max_errors: int = 10,
         seed: Optional[int] = None,
         solo_mode: bool = False,
+        calculate_uncertainty: bool = False,
     ):
         self.domain = domain
         self.agent = agent
@@ -61,6 +63,7 @@ class Orchestrator:
         self.task = task
         self.seed = seed
         self.solo_mode = solo_mode
+        self.calculate_uncertainty = calculate_uncertainty
         self.agent_state: Optional[Any] = None
         self.user_state: Optional[UserState] = None
         self.trajectory: list[Message] = []
@@ -281,6 +284,36 @@ class Orchestrator:
         )
         return simulation_run
 
+    def _calculate_and_attach_uncertainty(
+        self, message: Message
+    ) -> None:
+        """
+        Calculate uncertainty statistics for a message and attach to the message object.
+        
+        Calculates comprehensive uncertainty statistics including normalized entropy,
+        total entropy, token count, min/max/std uncertainty, and mean probability.
+        
+        Args:
+            message: The message to calculate uncertainty for
+        """
+        if not self.calculate_uncertainty:
+            return
+        
+        # Only calculate uncertainty for agent and user messages
+        if not isinstance(message, (AssistantMessage, UserMessage)):
+            return
+        
+        # Calculate uncertainty statistics from logprobs
+        if hasattr(message, 'logprobs') and message.logprobs is not None:
+            uncertainty_stats = get_uncertainty_stats(message.logprobs)
+            # Store as dictionary for JSON serialization
+            message.uncertainty = uncertainty_stats.model_dump()
+            logger.debug(
+                f"Calculated uncertainty for {message.role} message: "
+                f"U_i={uncertainty_stats.normalized_entropy:.4f} "
+                f"(tokens={uncertainty_stats.token_count})"
+            )
+
     def step(self):
         """
         Perform one step of the simulation.
@@ -302,6 +335,8 @@ class Orchestrator:
                 self.message, self.user_state
             )
             user_msg.validate()
+            # Calculate uncertainty if enabled
+            self._calculate_and_attach_uncertainty(user_msg)
             if UserSimulator.is_stop(user_msg):
                 self.done = True
                 self.termination_reason = TerminationReason.USER_STOP
@@ -320,6 +355,8 @@ class Orchestrator:
                 self.message, self.agent_state
             )
             agent_msg.validate()
+            # Calculate uncertainty if enabled
+            self._calculate_and_attach_uncertainty(agent_msg)
             if self.agent.is_stop(agent_msg):
                 self.done = True
                 self.termination_reason = TerminationReason.AGENT_STOP

@@ -107,6 +107,10 @@ class ParticipantMessageBase(BaseModel):
     raw_data: Optional[dict] = Field(
         description="The raw data of the message.", default=None
     )
+    uncertainty: Optional[dict] = Field(
+        description="Uncertainty statistics for this message (normalized entropy, token count, etc.).",
+        default=None,
+    )
     logprobs: Optional[dict] = Field(
         description="The log probabilities from the LLM response.", default=None
     )

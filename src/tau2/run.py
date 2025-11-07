@@ -22,6 +22,7 @@ from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
 from tau2.metrics.agent_metrics import compute_metrics
 from tau2.orchestrator.orchestrator import Orchestrator
 from tau2.registry import RegistryInfo, registry
+from tau2.scripts.analyze_uncertainty import print_uncertainty_summary_from_results
 from tau2.user.user_simulator import DummyUser, get_global_user_sim_guidelines
 from tau2.utils.display import ConsoleDisplay, Text
 from tau2.utils.pydantic_utils import get_pydantic_hash
@@ -146,6 +147,7 @@ def run_domain(config: RunConfig) -> Results:
         max_concurrency=config.max_concurrency,
         seed=config.seed,
         log_level=config.log_level,
+        calculate_uncertainty=config.calculate_uncertainty,
     )
     metrics = compute_metrics(simulation_results)
     ConsoleDisplay.display_agent_metrics(metrics)
@@ -171,6 +173,7 @@ def run_tasks(
     max_concurrency: int = 1,
     seed: Optional[int] = 300,
     log_level: Optional[str] = "INFO",
+    calculate_uncertainty: bool = False,
 ) -> Results:
     """
     Runs tasks for a given domain.
@@ -344,6 +347,7 @@ def run_tasks(
                 max_errors=max_errors,
                 evaluation_type=evaluation_type,
                 seed=seed,
+                calculate_uncertainty=calculate_uncertainty,
             )
             simulation.trial = trial
             if console_display:
@@ -374,6 +378,13 @@ def run_tasks(
         "\n✨ [bold green]Successfully completed all simulations![/bold green]\n"
         "To review the simulations, run: [bold blue]tau2 view[/bold blue]"
     )
+    
+    # Print uncertainty summary if uncertainty was calculated
+    if calculate_uncertainty:
+        print_uncertainty_summary_from_results(
+            simulation_results, console=ConsoleDisplay.console
+        )
+    
     return simulation_results
 
 
@@ -390,6 +401,7 @@ def run_task(
     max_errors: int = 10,
     evaluation_type: EvaluationType = EvaluationType.ALL,
     seed: Optional[int] = None,
+    calculate_uncertainty: bool = False,
 ) -> SimulationRun:
     """
     Runs tasks for a given domain.
@@ -483,6 +495,7 @@ def run_task(
         max_errors=max_errors,
         seed=seed,
         solo_mode=solo_mode,
+        calculate_uncertainty=calculate_uncertainty,
     )
     simulation = orchestrator.run()
 

@@ -178,6 +178,108 @@ def analyze_results(results: Results, verbose: bool = False) -> UncertaintyAnaly
     return UncertaintyAnalysis(metadata=metadata, results=analyzed_sims)
 
 
+def print_uncertainty_summary_from_results(
+    results: Results, console: Optional[Console] = None
+) -> None:
+    """
+    Print uncertainty summary directly from simulation results.
+    
+    This is a lightweight version that extracts and displays uncertainty
+    statistics from simulation results that have embedded uncertainty data
+    (i.e., simulations run with --calculate-uncertainty).
+    
+    Args:
+        results: Simulation results with embedded uncertainty data
+        console: Rich console (creates one if not provided)
+    """
+    if console is None:
+        console = Console()
+    
+    # Collect all uncertainty scores
+    all_agent_uncertainties = []
+    all_user_uncertainties = []
+    sims_with_uncertainty = 0
+    
+    for sim in results.simulations:
+        has_uncertainty = False
+        for msg in sim.messages:
+            # Only process messages that have the uncertainty attribute (AssistantMessage, UserMessage)
+            if hasattr(msg, 'uncertainty') and msg.uncertainty is not None:
+                has_uncertainty = True
+                uncertainty_score = msg.uncertainty.get('normalized_entropy', 0.0)
+                if msg.role == "assistant":
+                    all_agent_uncertainties.append(uncertainty_score)
+                elif msg.role == "user":
+                    all_user_uncertainties.append(uncertainty_score)
+        if has_uncertainty:
+            sims_with_uncertainty += 1
+    
+    # If no uncertainty data found, return early
+    if not all_agent_uncertainties and not all_user_uncertainties:
+        return
+    
+    # Print summary
+    console.print("\n" + "=" * 80, style="dim")
+    console.print(
+        "UNCERTAINTY ANALYSIS SUMMARY", style="bold cyan", justify="center"
+    )
+    console.print("=" * 80 + "\n", style="dim")
+    
+    # Metadata
+    console.print(f"[bold]Domain:[/bold] {results.info.environment_info.domain_name}")
+    console.print(f"[bold]Agent Model:[/bold] {results.info.agent_info.llm}")
+    console.print(f"[bold]User Model:[/bold] {results.info.user_info.llm}")
+    console.print(f"[bold]Simulations with Uncertainty:[/bold] {sims_with_uncertainty}/{len(results.simulations)}\n")
+    
+    # Overall statistics
+    console.print("[bold cyan]Overall Statistics[/bold cyan]")
+    
+    if all_agent_uncertainties:
+        console.print("\n[bold]Agent Reasoning Uncertainty (U_i,agent):[/bold]")
+        console.print(f"  Mean: {np.mean(all_agent_uncertainties):.4f}")
+        console.print(f"  Std:  {np.std(all_agent_uncertainties):.4f}")
+        console.print(f"  Min:  {np.min(all_agent_uncertainties):.4f}")
+        console.print(f"  Max:  {np.max(all_agent_uncertainties):.4f}")
+        console.print(f"  Total turns: {len(all_agent_uncertainties)}")
+    
+    if all_user_uncertainties:
+        console.print("\n[bold]User Confusion (U_i,user):[/bold]")
+        console.print(f"  Mean: {np.mean(all_user_uncertainties):.4f}")
+        console.print(f"  Std:  {np.std(all_user_uncertainties):.4f}")
+        console.print(f"  Min:  {np.min(all_user_uncertainties):.4f}")
+        console.print(f"  Max:  {np.max(all_user_uncertainties):.4f}")
+        console.print(f"  Total turns: {len(all_user_uncertainties)}")
+    
+    # Per-simulation summary (first 3)
+    console.print("\n[bold cyan]Per-Simulation Summary[/bold cyan] (showing first 3)\n")
+    for i, sim in enumerate(results.simulations[:3]):
+        agent_scores = []
+        user_scores = []
+        for msg in sim.messages:
+            # Only process messages that have the uncertainty attribute
+            if hasattr(msg, 'uncertainty') and msg.uncertainty is not None:
+                uncertainty_score = msg.uncertainty.get('normalized_entropy', 0.0)
+                if msg.role == "assistant":
+                    agent_scores.append(uncertainty_score)
+                elif msg.role == "user":
+                    user_scores.append(uncertainty_score)
+        
+        if agent_scores or user_scores:
+            console.print(f"[bold]Simulation {i+1}[/bold] (Task: {sim.task_id})")
+            console.print(f"  Turns: {len(agent_scores) + len(user_scores)}")
+            if agent_scores:
+                console.print(f"  Mean uncertainty (agent): {np.mean(agent_scores):.4f}")
+            if user_scores:
+                console.print(f"  Mean uncertainty (user):  {np.mean(user_scores):.4f}")
+            console.print()
+    
+    if len(results.simulations) > 3:
+        console.print(f"... and {len(results.simulations) - 3} more simulations\n")
+    
+    console.print("=" * 80, style="dim")
+    console.print()
+
+
 def print_summary(analysis: UncertaintyAnalysis, console: Console):
     """Print a summary of the analysis results."""
     console.print("\n" + "=" * 80, style="dim")
