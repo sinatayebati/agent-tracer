@@ -107,6 +107,9 @@ class ParticipantMessageBase(BaseModel):
     raw_data: Optional[dict] = Field(
         description="The raw data of the message.", default=None
     )
+    logprobs: Optional[dict] = Field(
+        description="The log probabilities from the LLM response.", default=None
+    )
 
     def validate(self):  # NOTE: It would be better to do this in the Pydantic model
         """

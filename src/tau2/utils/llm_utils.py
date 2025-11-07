@@ -110,6 +110,38 @@ def get_response_usage(response: ModelResponse) -> Optional[dict]:
     }
 
 
+def get_response_logprobs(response: ModelResponse) -> Optional[dict]:
+    """
+    Extract log probabilities from the response.
+    
+    Args:
+        response: The ModelResponse from litellm completion.
+        
+    Returns:
+        A dictionary containing the logprobs data, or None if not available.
+    """
+    try:
+        # LiteLLM stores logprobs in choices[0].logprobs
+        if hasattr(response, 'choices') and len(response.choices) > 0:
+            choice = response.choices[0]
+            if hasattr(choice, 'logprobs') and choice.logprobs is not None:
+                # Convert to dict if it's a Pydantic model or similar
+                logprobs_data = choice.logprobs
+                if hasattr(logprobs_data, 'model_dump'):
+                    return logprobs_data.model_dump()
+                elif hasattr(logprobs_data, 'dict'):
+                    return logprobs_data.dict()
+                elif isinstance(logprobs_data, dict):
+                    return logprobs_data
+                else:
+                    # Try to convert to dict
+                    return dict(logprobs_data) if logprobs_data else None
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to extract logprobs: {e}")
+        return None
+
+
 def to_tau2_messages(
     messages: list[dict], ignore_roles: set[str] = set()
 ) -> list[Message]:
@@ -201,6 +233,12 @@ def generate(
 
     if model.startswith("claude") and not ALLOW_SONNET_THINKING:
         kwargs["thinking"] = {"type": "disabled"}
+    
+    # Enable logprobs collection - request top logprobs for tokens
+    # For Vertex AI/Gemini, this will be handled by litellm's model-specific logic
+    if "logprobs" not in kwargs:
+        kwargs["logprobs"] = True
+    
     litellm_messages = to_litellm_messages(messages)
     tools = [tool.openai_schema for tool in tools] if tools else None
     if tools and tool_choice is None:
@@ -218,6 +256,7 @@ def generate(
         raise e
     cost = get_response_cost(response)
     usage = get_response_usage(response)
+    logprobs = get_response_logprobs(response)
     response = response.choices[0]
     try:
         finish_reason = response.finish_reason
@@ -248,6 +287,7 @@ def generate(
         cost=cost,
         usage=usage,
         raw_data=response.to_dict(),
+        logprobs=logprobs,
     )
     return message
 
