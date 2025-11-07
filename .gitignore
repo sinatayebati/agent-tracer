@@ -9,6 +9,7 @@ dump.rdb
 *.rdg
 logs/
 data/simulations/
+data/uncertainty/
 data/exp/
 data/datasets/
 data/models/
