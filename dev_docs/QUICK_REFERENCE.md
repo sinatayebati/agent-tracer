@@ -2,6 +2,21 @@
 
 ## 🚀 Common Commands
 
+### Run Simulations
+
+```bash
+# Basic simulation
+tau2 run --domain airline --agent-llm vertex_ai/gemini-2.5-flash --user-llm vertex_ai/gemini-2.5-flash
+
+# With real-time uncertainty calculation ✨ NEW!
+# Automatically calculates and displays uncertainty summary after completion
+tau2 run \
+  --domain airline \
+  --agent-llm vertex_ai/gemini-2.5-flash \
+  --user-llm vertex_ai/gemini-2.5-flash \
+  --calculate-uncertainty
+```
+
 ### Run Tests
 ```bash
 # Simple test runner (no dependencies needed)
@@ -14,20 +29,20 @@ pytest tests/test_uncertainty.py -v
 ### Analyze Simulations
 ```bash
 # Basic analysis (auto-saves to data/uncertainty/)
-python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json
+python -m src.tau2.scripts.analyze_uncertainty data/simulations/your_file.json
 
 # Detailed turn-by-turn view (auto-saves)
-python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --detailed
+python -m src.tau2.scripts.analyze_uncertainty data/simulations/your_file.json --detailed
 
 # Include verbose statistics in output
-python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --verbose
+python -m src.tau2.scripts.analyze_uncertainty data/simulations/your_file.json --verbose
 
 # Custom output location
-python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
+python -m src.tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
   --output results/custom_analysis.json
 
 # Don't save, just display results
-python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-save
+python -m src.tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-save
 ```
 
 **Note**: By default, results are automatically saved to `data/uncertainty/` with the same filename as your simulation file for easy cross-referencing.
@@ -81,7 +96,31 @@ print(f"Mean Probability: {stats.mean_probability:.4f}")
 print(f"Max Uncertainty: {stats.max_uncertainty:.4f}")
 ```
 
-### Analyze a Simulation File
+### Access Uncertainty from Real-Time Simulation
+
+If you ran simulation with `--calculate-uncertainty`, uncertainty stats are already embedded:
+
+```python
+from tau2.data_model.simulation import Results
+
+# Load simulation (run with --calculate-uncertainty)
+results = Results.load("data/simulations/your_file.json")
+
+# Access embedded uncertainty statistics
+for sim in results.simulations:
+    for msg in sim.messages:
+        if msg.uncertainty is not None:
+            u = msg.uncertainty
+            print(f"{msg.role}:")
+            print(f"  U_i (normalized_entropy): {u['normalized_entropy']:.4f}")
+            print(f"  Tokens: {u['token_count']}")
+            print(f"  Mean probability: {u['mean_probability']:.4f}")
+            print(f"  Std uncertainty: {u['std_uncertainty']:.4f}")
+```
+
+### Analyze a Simulation File (Post-Processing)
+
+For simulations run WITHOUT `--calculate-uncertainty`:
 
 ```python
 from pathlib import Path

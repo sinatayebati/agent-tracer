@@ -153,6 +153,13 @@ class RunConfig(BaseModel):
             default=DEFAULT_LOG_LEVEL,
         ),
     ]
+    calculate_uncertainty: Annotated[
+        bool,
+        Field(
+            description="Whether to calculate uncertainty scores in real-time during simulation",
+            default=False,
+        ),
+    ]
 
     def validate(self) -> None:
         """

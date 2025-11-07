@@ -129,6 +129,11 @@ def add_run_args(parser):
         default=DEFAULT_LOG_LEVEL,
         help=f"The log level to use for the simulation. Default is {DEFAULT_LOG_LEVEL}.",
     )
+    parser.add_argument(
+        "--calculate-uncertainty",
+        action="store_true",
+        help="Calculate uncertainty scores (normalized entropy) in real-time and store in simulation messages.",
+    )
 
 
 def main():
@@ -158,6 +163,7 @@ def main():
                 max_concurrency=args.max_concurrency,
                 seed=args.seed,
                 log_level=args.log_level,
+                calculate_uncertainty=args.calculate_uncertainty,
             )
         )
     )
