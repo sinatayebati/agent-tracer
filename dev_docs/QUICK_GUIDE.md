@@ -4,20 +4,32 @@
 
 ### Run Simulations
 
-```bash
-# Basic simulation
-tau2 run --domain airline --agent-llm vertex_ai/gemini-2.5-flash --user-llm vertex_ai/gemini-2.5-flash
+* Basic simulation w/ log probs only.
 
-# With real-time uncertainty calculation ✨ NEW!
-# Automatically calculates and displays uncertainty summary after completion
+```bash
+# Using your Gemini/Vertex AI models
 tau2 run \
   --domain airline \
+  --num-tasks 2 \
+  --num-trials 1 \
+  --max-steps 5 \
+  --agent-llm vertex_ai/gemini-2.5-flash \
+  --user-llm vertex_ai/gemini-2.5-flash \
+```
+
+* Advance simulation w/ uncertainty calculation
+
+```bash
+tau2 run \
+  --domain airline \
+  --num-tasks 2 \
+  --num-trials 1 \
   --agent-llm vertex_ai/gemini-2.5-flash \
   --user-llm vertex_ai/gemini-2.5-flash \
   --calculate-uncertainty
 ```
 
-### Run Tests
+### Run separate uncertainty tests
 ```bash
 # Simple test runner (no dependencies needed)
 python tests/run_uncertainty_tests.py
