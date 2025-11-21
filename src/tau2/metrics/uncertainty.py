@@ -8,14 +8,28 @@ Key metrics:
 - Normalized Entropy (single-step uncertainty)
 - Token-level uncertainties
 - Response statistics
+- Semantic Distance Metrics:
+  - Inquiry Drift (Da): measures deviation from initial goal
+  - Inference Gap (Do): measures coherence between action and observation
 
 Reference: SAUP paper, Equation 3 - Normalized Entropy
 """
 
+import os
 from typing import Optional
 
 import numpy as np
+from loguru import logger
 from pydantic import BaseModel
+
+# Vertex AI imports for embeddings
+try:
+    import vertexai
+    from vertexai.language_models import TextEmbeddingModel
+    VERTEX_AI_AVAILABLE = True
+except ImportError:
+    VERTEX_AI_AVAILABLE = False
+    logger.warning("Vertex AI not available. Semantic distance metrics will be disabled.")
 
 
 class TokenUncertainty(BaseModel):
@@ -257,4 +271,248 @@ def get_uncertainty_stats(logprobs_object: Optional[dict]) -> UncertaintyStats:
         std_uncertainty=float(np.std(uncertainties)),
         mean_probability=float(np.mean(probabilities)),
     )
+
+
+# ============================================================================
+# Semantic Distance Metrics (SAUP Situational Awareness Layer)
+# ============================================================================
+
+
+class EmbeddingService:
+    """
+    Singleton service for managing Vertex AI text embeddings.
+    
+    Loads the embedding model once and reuses it for all semantic distance
+    calculations during simulation.
+    """
+    
+    _instance: Optional['EmbeddingService'] = None
+    _model: Optional['TextEmbeddingModel'] = None
+    _initialized: bool = False
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self):
+        """Initialize the embedding service (only once)."""
+        if not self._initialized and VERTEX_AI_AVAILABLE:
+            try:
+                # Initialize Vertex AI (auto-detects project from environment)
+                # User should have GOOGLE_APPLICATION_CREDENTIALS or gcloud auth set up
+                project_id = os.getenv("GOOGLE_CLOUD_PROJECT")
+                if project_id:
+                    vertexai.init(project=project_id)
+                else:
+                    # Try default initialization
+                    vertexai.init()
+                
+                # Load the embedding model
+                # Using text-embedding-004 (latest, 768 dimensions)
+                self._model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+                self._initialized = True
+                logger.info("✓ Vertex AI embedding service initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Vertex AI embeddings: {e}")
+                self._model = None
+                self._initialized = False
+    
+    def get_embedding(self, text: str) -> Optional[np.ndarray]:
+        """
+        Generate embedding for a text string.
+        
+        Args:
+            text: Input text to embed
+            
+        Returns:
+            Embedding vector as numpy array, or None if service unavailable
+        """
+        if not self._initialized or self._model is None:
+            return None
+        
+        if not text or not text.strip():
+            return None
+        
+        try:
+            # Truncate text if too long (model limit is ~20k tokens)
+            # Keep approximately 15k tokens worth of text
+            max_chars = 60000
+            if len(text) > max_chars:
+                text = text[-max_chars:]  # Keep most recent content
+                logger.debug(f"Truncated text from {len(text)} to {max_chars} chars")
+            
+            # Get embeddings
+            embeddings = self._model.get_embeddings([text])
+            if embeddings and len(embeddings) > 0:
+                # Convert to numpy array
+                return np.array(embeddings[0].values)
+            return None
+        except Exception as e:
+            logger.error(f"Error generating embedding: {e}")
+            return None
+    
+    def is_available(self) -> bool:
+        """Check if the embedding service is available."""
+        return self._initialized and self._model is not None
+
+
+def calculate_semantic_distance(text_a: str, text_b: str) -> float:
+    """
+    Calculate semantic distance between two texts using cosine similarity.
+    
+    The semantic distance is defined as:
+        distance = 1 - cosine_similarity
+    
+    Where cosine_similarity is the cosine of the angle between two embedding
+    vectors. A distance of 0 means the texts are semantically identical,
+    while higher values indicate greater semantic divergence.
+    
+    Args:
+        text_a: First text string
+        text_b: Second text string
+        
+    Returns:
+        float: Semantic distance in range [0, 2] where:
+               - 0.0 = identical meaning
+               - ~0.5 = moderately related
+               - ~1.0 = unrelated
+               - >1.0 = opposite meaning (rare)
+               Returns 0.0 if embeddings cannot be generated
+    
+    Example:
+        >>> distance = calculate_semantic_distance(
+        ...     "Book a flight to Paris",
+        ...     "Reserve tickets to France"
+        ... )
+        >>> # Should return a low value (similar meaning)
+    """
+    # Handle edge cases
+    if not text_a or not text_b:
+        return 0.0
+    
+    if not text_a.strip() or not text_b.strip():
+        return 0.0
+    
+    # Get embeddings
+    service = EmbeddingService()
+    if not service.is_available():
+        logger.debug("Embedding service not available, returning 0.0")
+        return 0.0
+    
+    embedding_a = service.get_embedding(text_a)
+    embedding_b = service.get_embedding(text_b)
+    
+    if embedding_a is None or embedding_b is None:
+        logger.debug("Failed to generate embeddings, returning 0.0")
+        return 0.0
+    
+    # Calculate cosine similarity
+    try:
+        # Normalize vectors
+        norm_a = np.linalg.norm(embedding_a)
+        norm_b = np.linalg.norm(embedding_b)
+        
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        
+        # Cosine similarity = dot product / (norm_a * norm_b)
+        cosine_sim = np.dot(embedding_a, embedding_b) / (norm_a * norm_b)
+        
+        # Distance = 1 - similarity
+        distance = 1.0 - float(cosine_sim)
+        
+        # Clamp to [0, 2] range (theoretical maximum)
+        distance = max(0.0, min(2.0, distance))
+        
+        return distance
+    except Exception as e:
+        logger.error(f"Error calculating cosine similarity: {e}")
+        return 0.0
+
+
+def calculate_inquiry_drift(
+    user_instruction: str,
+    history_so_far: list[str]
+) -> float:
+    """
+    Calculate Inquiry Drift (Da) - semantic distance from initial goal.
+    
+    Measures how much the conversation has drifted from the original user
+    instruction/goal. This is computed by comparing the initial instruction
+    with the concatenated conversation history.
+    
+    Formula:
+        Da = SemanticDistance(user_instruction, concatenate(history_so_far))
+    
+    Args:
+        user_instruction: The initial goal/problem description from the task
+        history_so_far: List of all text strings (messages, tool calls,
+                       observations) generated in the conversation up to
+                       the current step
+                       
+    Returns:
+        float: Inquiry drift score in range [0, 2] where:
+               - 0.0 = conversation perfectly aligned with goal
+               - ~0.5 = moderate drift
+               - >1.0 = significant drift from original intent
+               Returns 0.0 if calculation fails
+    
+    Example:
+        >>> drift = calculate_inquiry_drift(
+        ...     "I need to change my flight",
+        ...     ["Can you help?", "Looking up flights...", "Found 3 options"]
+        ... )
+    """
+    if not user_instruction or not history_so_far:
+        return 0.0
+    
+    # Concatenate history into single string
+    # Use newlines to separate turns for better semantic representation
+    concatenated_history = "\n".join(history_so_far)
+    
+    if not concatenated_history.strip():
+        return 0.0
+    
+    # Calculate semantic distance
+    distance = calculate_semantic_distance(user_instruction, concatenated_history)
+    
+    return distance
+
+
+def calculate_inference_gap(antecedent: str, consequent: str) -> float:
+    """
+    Calculate Inference Gap (Do) - semantic distance between action and observation.
+    
+    In the dual-control Tau-2 environment, this metric measures:
+    - Agent Coherence: Distance between agent's tool call and its observation
+    - User Coherence: Distance between agent's message and user's response
+    
+    Formula:
+        Do = SemanticDistance(antecedent, consequent)
+    
+    Args:
+        antecedent: What was intended/asked (agent's action or message)
+        consequent: What actually happened (observation or user's response)
+        
+    Returns:
+        float: Inference gap score in range [0, 2] where:
+               - 0.0 = perfect coherence between action and outcome
+               - ~0.5 = moderate gap
+               - >1.0 = significant mismatch
+               Returns 0.0 if calculation fails
+    
+    Example (Agent Coherence):
+        >>> gap = calculate_inference_gap(
+        ...     "Tool: get_customer_info(id='123')",
+        ...     "Customer John Doe, phone: 555-1234"
+        ... )
+        
+    Example (User Coherence):
+        >>> gap = calculate_inference_gap(
+        ...     "Please provide your account number",
+        ...     "My number is ABC-123"
+        ... )
+    """
+    return calculate_semantic_distance(antecedent, consequent)
 

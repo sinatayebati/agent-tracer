@@ -49,6 +49,9 @@ class TurnUncertainty(BaseModel):
     ui_score: float
     content_preview: str
     statistics: Optional[dict] = None
+    da_score: Optional[float] = None
+    do_score: Optional[float] = None
+    do_type: Optional[str] = None
 
 
 class SimulationUncertainty(BaseModel):
@@ -98,6 +101,11 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
         # Extract logprobs and calculate uncertainty
         logprobs = message.get("logprobs")
         ui_score = calculate_normalized_entropy(logprobs)
+        
+        # Extract semantic distance metrics
+        da_score = message.get("da_score")
+        do_score = message.get("do_score")
+        do_type = message.get("do_type")
 
         # Build turn data
         turn_data = TurnUncertainty(
@@ -110,6 +118,9 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
                 if message.get("content")
                 else "[tool_call]"
             ),
+            da_score=da_score,
+            do_score=do_score,
+            do_type=do_type,
         )
 
         # Add detailed statistics if requested
@@ -124,6 +135,12 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
     if uncertainty_scores:
         agent_scores = [s.ui_score for s in uncertainty_scores if s.actor == "agent"]
         user_scores = [s.ui_score for s in uncertainty_scores if s.actor == "user"]
+        
+        # Semantic distance metrics
+        da_scores = [s.da_score for s in uncertainty_scores if s.da_score is not None]
+        do_scores = [s.do_score for s in uncertainty_scores if s.do_score is not None]
+        do_agent_coherence = [s.do_score for s in uncertainty_scores if s.do_score is not None and s.do_type == "agent_coherence"]
+        do_user_coherence = [s.do_score for s in uncertainty_scores if s.do_score is not None and s.do_type == "user_coherence"]
 
         summary = {
             "mean_uncertainty_overall": float(
@@ -136,6 +153,15 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
             ),
             "agent_turn_count": len(agent_scores),
             "user_turn_count": len(user_scores),
+            # Semantic distance metrics
+            "mean_da_score": float(np.mean(da_scores)) if da_scores else None,
+            "std_da_score": float(np.std(da_scores)) if da_scores else None,
+            "mean_do_score": float(np.mean(do_scores)) if do_scores else None,
+            "std_do_score": float(np.std(do_scores)) if do_scores else None,
+            "mean_do_agent_coherence": float(np.mean(do_agent_coherence)) if do_agent_coherence else None,
+            "mean_do_user_coherence": float(np.mean(do_user_coherence)) if do_user_coherence else None,
+            "da_count": len(da_scores),
+            "do_count": len(do_scores),
         }
 
     return SimulationUncertainty(
@@ -195,9 +221,13 @@ def print_uncertainty_summary_from_results(
     if console is None:
         console = Console()
     
-    # Collect all uncertainty scores
+    # Collect all uncertainty and semantic distance scores
     all_agent_uncertainties = []
     all_user_uncertainties = []
+    all_da_scores = []
+    all_do_scores = []
+    all_do_agent = []
+    all_do_user = []
     sims_with_uncertainty = 0
     
     for sim in results.simulations:
@@ -211,6 +241,17 @@ def print_uncertainty_summary_from_results(
                     all_agent_uncertainties.append(uncertainty_score)
                 elif msg.role == "user":
                     all_user_uncertainties.append(uncertainty_score)
+            
+            # Collect semantic distance metrics
+            if hasattr(msg, 'da_score') and msg.da_score is not None:
+                all_da_scores.append(msg.da_score)
+            if hasattr(msg, 'do_score') and msg.do_score is not None:
+                all_do_scores.append(msg.do_score)
+                if hasattr(msg, 'do_type'):
+                    if msg.do_type == "agent_coherence":
+                        all_do_agent.append(msg.do_score)
+                    elif msg.do_type == "user_coherence":
+                        all_do_user.append(msg.do_score)
         if has_uncertainty:
             sims_with_uncertainty += 1
     
@@ -249,6 +290,36 @@ def print_uncertainty_summary_from_results(
         console.print(f"  Min:  {np.min(all_user_uncertainties):.4f}")
         console.print(f"  Max:  {np.max(all_user_uncertainties):.4f}")
         console.print(f"  Total turns: {len(all_user_uncertainties)}")
+    
+    # Semantic distance metrics
+    if all_da_scores or all_do_scores:
+        console.print("\n[bold cyan]Semantic Distance Metrics[/bold cyan]")
+        
+        if all_da_scores:
+            console.print("\n[bold]Inquiry Drift (Da):[/bold]")
+            console.print(f"  Mean: {np.mean(all_da_scores):.4f}")
+            console.print(f"  Std:  {np.std(all_da_scores):.4f}")
+            console.print(f"  Min:  {np.min(all_da_scores):.4f}")
+            console.print(f"  Max:  {np.max(all_da_scores):.4f}")
+            console.print(f"  Total measurements: {len(all_da_scores)}")
+        
+        if all_do_scores:
+            console.print("\n[bold]Inference Gap (Do):[/bold]")
+            console.print(f"  Mean: {np.mean(all_do_scores):.4f}")
+            console.print(f"  Std:  {np.std(all_do_scores):.4f}")
+            console.print(f"  Min:  {np.min(all_do_scores):.4f}")
+            console.print(f"  Max:  {np.max(all_do_scores):.4f}")
+            console.print(f"  Total measurements: {len(all_do_scores)}")
+            
+            if all_do_agent:
+                console.print(f"\n  [dim]Agent Coherence:[/dim]")
+                console.print(f"    Mean: {np.mean(all_do_agent):.4f}")
+                console.print(f"    Count: {len(all_do_agent)}")
+            
+            if all_do_user:
+                console.print(f"\n  [dim]User Coherence:[/dim]")
+                console.print(f"    Mean: {np.mean(all_do_user):.4f}")
+                console.print(f"    Count: {len(all_do_user)}")
     
     # Per-simulation summary (first 3)
     console.print("\n[bold cyan]Per-Simulation Summary[/bold cyan] (showing first 3)\n")
@@ -326,6 +397,52 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
             console.print(f"  Std:  {np.std(all_user_uncertainties):.4f}")
             console.print(f"  Min:  {np.min(all_user_uncertainties):.4f}")
             console.print(f"  Max:  {np.max(all_user_uncertainties):.4f}")
+    
+    # Semantic distance metrics
+    all_da_scores = []
+    all_do_scores = []
+    all_do_agent = []
+    all_do_user = []
+    
+    for sim in analysis.results:
+        for score in sim.uncertainty_scores:
+            if score.da_score is not None:
+                all_da_scores.append(score.da_score)
+            if score.do_score is not None:
+                all_do_scores.append(score.do_score)
+                if score.do_type == "agent_coherence":
+                    all_do_agent.append(score.do_score)
+                elif score.do_type == "user_coherence":
+                    all_do_user.append(score.do_score)
+    
+    if all_da_scores or all_do_scores:
+        console.print("\n[bold cyan]Semantic Distance Metrics[/bold cyan]")
+        
+        if all_da_scores:
+            console.print("\n[bold]Inquiry Drift (Da):[/bold]")
+            console.print(f"  Mean: {np.mean(all_da_scores):.4f}")
+            console.print(f"  Std:  {np.std(all_da_scores):.4f}")
+            console.print(f"  Min:  {np.min(all_da_scores):.4f}")
+            console.print(f"  Max:  {np.max(all_da_scores):.4f}")
+            console.print(f"  Count: {len(all_da_scores)}")
+        
+        if all_do_scores:
+            console.print("\n[bold]Inference Gap (Do):[/bold]")
+            console.print(f"  Mean: {np.mean(all_do_scores):.4f}")
+            console.print(f"  Std:  {np.std(all_do_scores):.4f}")
+            console.print(f"  Min:  {np.min(all_do_scores):.4f}")
+            console.print(f"  Max:  {np.max(all_do_scores):.4f}")
+            console.print(f"  Count: {len(all_do_scores)}")
+            
+            if all_do_agent:
+                console.print(f"\n  [dim]Agent Coherence:[/dim]")
+                console.print(f"    Mean: {np.mean(all_do_agent):.4f}")
+                console.print(f"    Count: {len(all_do_agent)}")
+            
+            if all_do_user:
+                console.print(f"\n  [dim]User Coherence:[/dim]")
+                console.print(f"    Mean: {np.mean(all_do_user):.4f}")
+                console.print(f"    Count: {len(all_do_user)}")
 
     # Per-simulation summary
     console.print("\n[bold cyan]Per-Simulation Summary[/bold cyan]\n")
@@ -377,23 +494,53 @@ def print_detailed_trajectory(
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("Turn", style="dim", width=6)
     table.add_column("Actor", width=10)
-    table.add_column("U_i Score", justify="right", width=12)
-    table.add_column("Content Preview", width=50)
+    table.add_column("U_i", justify="right", width=10)
+    table.add_column("Da", justify="right", width=10)
+    table.add_column("Do", justify="right", width=10)
+    table.add_column("Do Type", width=12)
+    table.add_column("Content Preview", width=40)
 
     for score in sim.uncertainty_scores:
         # Color code by uncertainty level
         if score.ui_score < 0.1:
-            color = "green"
+            ui_color = "green"
         elif score.ui_score < 0.3:
-            color = "yellow"
+            ui_color = "yellow"
         else:
-            color = "red"
+            ui_color = "red"
+        
+        # Color code Da (inquiry drift)
+        da_str = "—"
+        if score.da_score is not None:
+            if score.da_score < 0.3:
+                da_color = "green"
+            elif score.da_score < 0.6:
+                da_color = "yellow"
+            else:
+                da_color = "red"
+            da_str = f"[{da_color}]{score.da_score:.4f}[/{da_color}]"
+        
+        # Color code Do (inference gap)
+        do_str = "—"
+        if score.do_score is not None:
+            if score.do_score < 0.3:
+                do_color = "green"
+            elif score.do_score < 0.6:
+                do_color = "yellow"
+            else:
+                do_color = "red"
+            do_str = f"[{do_color}]{score.do_score:.4f}[/{do_color}]"
+        
+        do_type_str = score.do_type if score.do_type else "—"
 
         table.add_row(
             str(score.turn),
             score.actor,
-            f"[{color}]{score.ui_score:.4f}[/{color}]",
-            score.content_preview[:50] + "...",
+            f"[{ui_color}]{score.ui_score:.4f}[/{ui_color}]",
+            da_str,
+            do_str,
+            do_type_str,
+            score.content_preview[:40] + "...",
         )
 
     console.print(table)
