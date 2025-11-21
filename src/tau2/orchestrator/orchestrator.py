@@ -21,7 +21,12 @@ from tau2.data_model.tasks import EnvFunctionCall, InitializationData, Task
 from tau2.environment.environment import Environment, EnvironmentInfo
 from tau2.user.base import BaseUser, is_valid_user_history_message
 from tau2.user.user_simulator import DummyUser, UserSimulator, UserState
-from tau2.metrics.uncertainty import get_uncertainty_stats
+from tau2.metrics.uncertainty import (
+    EmbeddingService,
+    calculate_inference_gap,
+    calculate_inquiry_drift,
+    get_uncertainty_stats,
+)
 from tau2.utils.llm_utils import get_cost
 from tau2.utils.utils import format_time, get_now
 
@@ -76,6 +81,27 @@ class Orchestrator:
         self.from_role: Optional[Role] = None
         self.to_role: Optional[Role] = None
         self.message: Optional[Message] = None
+        
+        # Situational awareness tracking (reuses calculate_uncertainty flag)
+        self.calculate_situational_awareness = calculate_uncertainty
+        self.conversation_history: list[str] = []
+        self.initial_instruction: Optional[str] = None
+        self.last_agent_message: Optional[str] = None
+        
+        # Initialize embedding service if enabled
+        if self.calculate_situational_awareness:
+            self.embedding_service = EmbeddingService()
+            # Extract initial user instruction from task
+            if task.user_scenario and hasattr(task.user_scenario, 'instructions'):
+                instructions = task.user_scenario.instructions
+                if isinstance(instructions, dict):
+                    # Convert dict to string representation
+                    self.initial_instruction = str(instructions)
+                else:
+                    self.initial_instruction = str(instructions)
+            logger.debug(f"Situational awareness enabled. Initial instruction: {self.initial_instruction[:100] if self.initial_instruction else 'None'}...")
+        else:
+            self.embedding_service = None
 
     def initialize(self):
         """
@@ -284,22 +310,59 @@ class Orchestrator:
         )
         return simulation_run
 
-    def _calculate_and_attach_uncertainty(
+    def _format_message_for_history(self, message: Message) -> str:
+        """
+        Format a message for inclusion in conversation history.
+        
+        Converts messages to readable string format for semantic distance calculation.
+        
+        Args:
+            message: Message to format
+            
+        Returns:
+            str: Formatted message string
+        """
+        if isinstance(message, (AssistantMessage, UserMessage)):
+            parts = []
+            
+            # Add text content
+            if message.content:
+                parts.append(message.content)
+            
+            # Add tool calls description
+            if message.tool_calls:
+                for tool_call in message.tool_calls:
+                    tool_str = f"Tool: {tool_call.name}({tool_call.arguments})"
+                    parts.append(tool_str)
+            
+            return " | ".join(parts) if parts else ""
+        
+        elif isinstance(message, ToolMessage):
+            # Format tool observation
+            if message.content:
+                return f"Observation: {message.content}"
+            return "Observation: [empty]"
+        
+        return ""
+    
+    def _calculate_and_attach_metrics(
         self, message: Message
     ) -> None:
         """
-        Calculate uncertainty statistics for a message and attach to the message object.
+        Calculate and attach uncertainty and semantic distance metrics to a message.
         
-        Calculates comprehensive uncertainty statistics including normalized entropy,
-        total entropy, token count, min/max/std uncertainty, and mean probability.
+        Calculates:
+        - Uncertainty statistics (U_i): normalized entropy from logprobs
+        - Inquiry Drift (Da): semantic distance from initial goal
+        - Inference Gap (Do): semantic distance between action and observation
         
         Args:
-            message: The message to calculate uncertainty for
+            message: The message to calculate metrics for
         """
         if not self.calculate_uncertainty:
             return
         
-        # Only calculate uncertainty for agent and user messages
+        # Only calculate metrics for agent and user messages
         if not isinstance(message, (AssistantMessage, UserMessage)):
             return
         
@@ -313,6 +376,21 @@ class Orchestrator:
                 f"U_i={uncertainty_stats.normalized_entropy:.4f} "
                 f"(tokens={uncertainty_stats.token_count})"
             )
+        
+        # Calculate semantic distance metrics if situational awareness enabled
+        if self.calculate_situational_awareness and self.embedding_service:
+            # Calculate Da (Inquiry Drift)
+            if self.initial_instruction and self.conversation_history:
+                try:
+                    da_score = calculate_inquiry_drift(
+                        self.initial_instruction,
+                        self.conversation_history
+                    )
+                    message.da_score = da_score
+                    logger.debug(f"Calculated Da for {message.role}: {da_score:.4f}")
+                except Exception as e:
+                    logger.warning(f"Failed to calculate Da: {e}")
+                    message.da_score = None
 
     def step(self):
         """
@@ -335,8 +413,32 @@ class Orchestrator:
                 self.message, self.user_state
             )
             user_msg.validate()
-            # Calculate uncertainty if enabled
-            self._calculate_and_attach_uncertainty(user_msg)
+            
+            # Add to conversation history
+            if self.calculate_situational_awareness:
+                msg_text = self._format_message_for_history(user_msg)
+                if msg_text:
+                    self.conversation_history.append(msg_text)
+            
+            # Calculate metrics (uncertainty + semantic distance)
+            self._calculate_and_attach_metrics(user_msg)
+            
+            # Calculate Do (Inference Gap) for User Coherence
+            # Antecedent = agent's last message, Consequent = user's response
+            if self.calculate_situational_awareness and self.last_agent_message:
+                try:
+                    user_response = self._format_message_for_history(user_msg)
+                    if user_response:
+                        do_score = calculate_inference_gap(
+                            self.last_agent_message,
+                            user_response
+                        )
+                        user_msg.do_score = do_score
+                        user_msg.do_type = "user_coherence"
+                        logger.debug(f"Calculated Do (user coherence): {do_score:.4f}")
+                except Exception as e:
+                    logger.warning(f"Failed to calculate Do for user: {e}")
+            
             if UserSimulator.is_stop(user_msg):
                 self.done = True
                 self.termination_reason = TerminationReason.USER_STOP
@@ -355,8 +457,18 @@ class Orchestrator:
                 self.message, self.agent_state
             )
             agent_msg.validate()
-            # Calculate uncertainty if enabled
-            self._calculate_and_attach_uncertainty(agent_msg)
+            
+            # Add to conversation history
+            if self.calculate_situational_awareness:
+                msg_text = self._format_message_for_history(agent_msg)
+                if msg_text:
+                    self.conversation_history.append(msg_text)
+                    # Store last agent message for user coherence calculation
+                    self.last_agent_message = msg_text
+            
+            # Calculate metrics (uncertainty + semantic distance)
+            self._calculate_and_attach_metrics(agent_msg)
+            
             if self.agent.is_stop(agent_msg):
                 self.done = True
                 self.termination_reason = TerminationReason.AGENT_STOP
@@ -371,6 +483,11 @@ class Orchestrator:
         elif self.from_role in [Role.AGENT, Role.USER] and self.to_role == Role.ENV:
             if not self.message.is_tool_call():
                 raise ValueError("Agent or User should send tool call to environment")
+            
+            # Store the tool call message for Do calculation
+            tool_call_msg = self.message
+            tool_call_text = self._format_message_for_history(tool_call_msg) if self.calculate_situational_awareness else None
+            
             tool_msgs = []
             for tool_call in self.message.tool_calls:
                 tool_msg = self.environment.get_response(tool_call)
@@ -378,6 +495,39 @@ class Orchestrator:
             assert len(self.message.tool_calls) == len(tool_msgs), (
                 "Number of tool calls and tool messages should be the same"
             )
+            
+            # Calculate Do (Inference Gap) for Agent/User Tool Coherence
+            if self.calculate_situational_awareness and tool_call_text:
+                try:
+                    # Concatenate all tool observations
+                    tool_observations = []
+                    for tool_msg in tool_msgs:
+                        obs = self._format_message_for_history(tool_msg)
+                        if obs:
+                            tool_observations.append(obs)
+                    
+                    if tool_observations:
+                        combined_observation = " | ".join(tool_observations)
+                        do_score = calculate_inference_gap(
+                            tool_call_text,
+                            combined_observation
+                        )
+                        
+                        # Attach Do score to the requesting message (agent or user)
+                        if self.from_role == Role.AGENT:
+                            tool_call_msg.do_score = do_score
+                            tool_call_msg.do_type = "agent_coherence"
+                            logger.debug(f"Calculated Do (agent coherence): {do_score:.4f}")
+                        elif self.from_role == Role.USER:
+                            tool_call_msg.do_score = do_score
+                            tool_call_msg.do_type = "user_coherence"
+                            logger.debug(f"Calculated Do (user tool coherence): {do_score:.4f}")
+                        
+                        # Add tool observation to history
+                        self.conversation_history.append(combined_observation)
+                except Exception as e:
+                    logger.warning(f"Failed to calculate Do for tool call: {e}")
+            
             self.trajectory.extend(tool_msgs)
             if (
                 len(tool_msgs) > 1

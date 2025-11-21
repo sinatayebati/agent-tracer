@@ -114,6 +114,18 @@ class ParticipantMessageBase(BaseModel):
     logprobs: Optional[dict] = Field(
         description="The log probabilities from the LLM response.", default=None
     )
+    da_score: Optional[float] = Field(
+        description="Inquiry Drift score (semantic distance from initial goal)",
+        default=None,
+    )
+    do_score: Optional[float] = Field(
+        description="Inference Gap score (semantic distance between action and observation)",
+        default=None,
+    )
+    do_type: Optional[str] = Field(
+        description="Type of inference gap: 'agent_coherence' or 'user_coherence'",
+        default=None,
+    )
 
     def validate(self):  # NOTE: It would be better to do this in the Pydantic model
         """
