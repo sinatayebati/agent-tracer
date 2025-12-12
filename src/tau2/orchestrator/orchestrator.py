@@ -23,8 +23,10 @@ from tau2.user.base import BaseUser, is_valid_user_history_message
 from tau2.user.user_simulator import DummyUser, UserSimulator, UserState
 from tau2.metrics.uncertainty import (
     EmbeddingService,
+    SAUPConfig,
     calculate_inference_gap,
     calculate_inquiry_drift,
+    calculate_saup_from_trajectory,
     get_uncertainty_stats,
 )
 from tau2.utils.llm_utils import get_cost
@@ -60,6 +62,7 @@ class Orchestrator:
         seed: Optional[int] = None,
         solo_mode: bool = False,
         calculate_uncertainty: bool = False,
+        saup_config: Optional[SAUPConfig] = None,
     ):
         self.domain = domain
         self.agent = agent
@@ -81,6 +84,9 @@ class Orchestrator:
         self.from_role: Optional[Role] = None
         self.to_role: Optional[Role] = None
         self.message: Optional[Message] = None
+        
+        # SAUP configuration
+        self.saup_config = saup_config if saup_config is not None else SAUPConfig()
         
         # Situational awareness tracking (reuses calculate_uncertainty flag)
         self.calculate_situational_awareness = calculate_uncertainty
@@ -295,6 +301,22 @@ class Orchestrator:
             agent_cost, user_cost = None, None
         else:
             agent_cost, user_cost = res
+        
+        # Calculate SAUP-D aggregation score if uncertainty is enabled
+        saup_metrics = None
+        if self.calculate_uncertainty:
+            try:
+                saup_result = calculate_saup_from_trajectory(messages, self.saup_config)
+                # Remove weights list from output (too verbose for JSON)
+                saup_metrics = {k: v for k, v in saup_result.items() if k != 'weights'}
+                logger.info(
+                    f"SAUP-D Score: {saup_metrics['saup_score']:.4f} "
+                    f"(N={saup_metrics['num_steps']}, mean_weight={saup_metrics['mean_weight']:.4f})"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to calculate SAUP score: {e}")
+                saup_metrics = None
+        
         simulation_run = SimulationRun(
             id=str(uuid.uuid4()),
             task_id=self.task.id,
@@ -307,6 +329,7 @@ class Orchestrator:
             agent_cost=agent_cost,
             messages=messages,
             seed=self.seed,
+            saup_metrics=saup_metrics,
         )
         return simulation_run
 

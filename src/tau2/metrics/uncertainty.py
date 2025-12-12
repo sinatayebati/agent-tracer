@@ -11,11 +11,13 @@ Key metrics:
 - Semantic Distance Metrics:
   - Inquiry Drift (Da): measures deviation from initial goal
   - Inference Gap (Do): measures coherence between action and observation
+- SAUP-D Aggregation: weighted RMS combining all metrics into trajectory score
 
 Reference: SAUP paper, Equation 3 - Normalized Entropy
 """
 
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -515,4 +517,229 @@ def calculate_inference_gap(antecedent: str, consequent: str) -> float:
         ... )
     """
     return calculate_semantic_distance(antecedent, consequent)
+
+
+# ============================================================================
+# SAUP-D Aggregation (Final Trajectory Score)
+# ============================================================================
+
+
+@dataclass
+class SAUPConfig:
+    """
+    Configuration for SAUP-D aggregation.
+    
+    The situational weight for each step is calculated as:
+        W_i = alpha * Da_i + beta * Do_agent_i + gamma * Do_user_i
+    
+    Attributes:
+        alpha: Weight for inquiry drift (Da) - default 1.0
+        beta: Weight for agent coherence (Do_agent) - default 1.0
+        gamma: Weight for user coherence (Do_user) - default 1.0
+    """
+    alpha: float = 1.0
+    beta: float = 1.0
+    gamma: float = 1.0
+
+
+def calculate_situational_weight(
+    da: Optional[float],
+    do_agent: Optional[float],
+    do_user: Optional[float],
+    config: SAUPConfig
+) -> float:
+    """
+    Calculate situational weight W_i for a single step.
+    
+    The weight combines semantic distance metrics (Da, Do) to measure
+    how "risky" or "uncertain" the situational context is at step i.
+    
+    Formula:
+        W_i = alpha * Da_i + beta * Do_agent_i + gamma * Do_user_i
+    
+    Args:
+        da: Inquiry drift score (None treated as 0.0)
+        do_agent: Agent coherence score (None treated as 0.0)
+        do_user: User coherence score (None treated as 0.0)
+        config: SAUP configuration with alpha, beta, gamma weights
+        
+    Returns:
+        float: Situational weight W_i >= 0
+    
+    Example:
+        >>> config = SAUPConfig(alpha=1.0, beta=1.0, gamma=1.0)
+        >>> w = calculate_situational_weight(0.2, 0.3, None, config)
+        >>> # Returns: 1.0*0.2 + 1.0*0.3 + 1.0*0.0 = 0.5
+    """
+    # Handle None values (treat as 0.0)
+    da_val = da if da is not None else 0.0
+    do_agent_val = do_agent if do_agent is not None else 0.0
+    do_user_val = do_user if do_user is not None else 0.0
+    
+    # Linear combination
+    weight = (
+        config.alpha * da_val +
+        config.beta * do_agent_val +
+        config.gamma * do_user_val
+    )
+    
+    return float(weight)
+
+
+def calculate_saup_score(
+    step_data: list[dict],
+    config: Optional[SAUPConfig] = None
+) -> dict:
+    """
+    Calculate SAUP-D aggregation score for a trajectory using weighted RMS.
+    
+    Implements the core SAUP-D formula (Equation 1 from paper):
+        U_trajectory = sqrt( (1/N) * sum((W_i * U_i)^2) )
+    
+    Where:
+        - N = number of steps
+        - W_i = situational weight for step i
+        - U_i = normalized entropy for step i
+    
+    Args:
+        step_data: List of step dictionaries containing:
+                   - 'ui': normalized entropy (required)
+                   - 'da': inquiry drift (optional)
+                   - 'do_agent': agent coherence (optional)
+                   - 'do_user': user coherence (optional)
+        config: SAUP configuration (defaults to SAUPConfig())
+        
+    Returns:
+        dict: {
+            'saup_score': float - final trajectory score,
+            'num_steps': int - number of steps included,
+            'mean_weight': float - average W_i across steps,
+            'std_weight': float - std deviation of weights,
+            'mean_ui': float - average U_i across steps,
+            'weights': list[float] - W_i for each step (for debugging)
+        }
+    
+    Example:
+        >>> steps = [
+        ...     {'ui': 0.1, 'da': 0.2, 'do_agent': 0.3, 'do_user': None},
+        ...     {'ui': 0.15, 'da': 0.25, 'do_agent': None, 'do_user': 0.35}
+        ... ]
+        >>> result = calculate_saup_score(steps)
+        >>> print(f"SAUP Score: {result['saup_score']:.4f}")
+    """
+    if config is None:
+        config = SAUPConfig()
+    
+    if not step_data:
+        return {
+            'saup_score': 0.0,
+            'num_steps': 0,
+            'mean_weight': 0.0,
+            'std_weight': 0.0,
+            'mean_ui': 0.0,
+            'weights': []
+        }
+    
+    # Calculate weights and weighted squared terms
+    weights = []
+    weighted_squared_terms = []
+    ui_values = []
+    
+    for step in step_data:
+        # Extract metrics
+        ui = step.get('ui', 0.0)
+        da = step.get('da')
+        do_agent = step.get('do_agent')
+        do_user = step.get('do_user')
+        
+        # Calculate situational weight
+        w_i = calculate_situational_weight(da, do_agent, do_user, config)
+        
+        # Calculate weighted squared term: (W_i * U_i)^2
+        weighted_term = w_i * ui
+        weighted_squared = weighted_term ** 2
+        
+        weights.append(w_i)
+        weighted_squared_terms.append(weighted_squared)
+        ui_values.append(ui)
+    
+    # Calculate SAUP score using weighted RMS formula
+    N = len(step_data)
+    sum_weighted_squared = sum(weighted_squared_terms)
+    saup_score = np.sqrt(sum_weighted_squared / N)
+    
+    # Calculate statistics
+    result = {
+        'saup_score': float(saup_score),
+        'num_steps': N,
+        'mean_weight': float(np.mean(weights)) if weights else 0.0,
+        'std_weight': float(np.std(weights)) if weights else 0.0,
+        'mean_ui': float(np.mean(ui_values)) if ui_values else 0.0,
+        'weights': weights
+    }
+    
+    return result
+
+
+def calculate_saup_from_trajectory(
+    messages: list,
+    config: Optional[SAUPConfig] = None
+) -> dict:
+    """
+    Convenience function to calculate SAUP score directly from message objects.
+    
+    Extracts U_i, Da, and Do metrics from message objects and calculates
+    the final SAUP-D trajectory score.
+    
+    Args:
+        messages: List of message objects (AssistantMessage, UserMessage)
+                  with uncertainty, da_score, do_score, do_type attributes
+        config: SAUP configuration (defaults to SAUPConfig())
+        
+    Returns:
+        dict: SAUP metrics (same as calculate_saup_score)
+    
+    Example:
+        >>> # After running a simulation with --calculate-uncertainty
+        >>> from tau2.data_model.simulation import Results
+        >>> results = Results.load("simulation.json")
+        >>> sim = results.simulations[0]
+        >>> saup = calculate_saup_from_trajectory(sim.messages)
+        >>> print(f"Trajectory Score: {saup['saup_score']:.4f}")
+    """
+    step_data = []
+    
+    for msg in messages:
+        # Only process agent and user messages
+        if not hasattr(msg, 'role') or msg.role not in ['assistant', 'user']:
+            continue
+        
+        # Skip if no uncertainty data
+        if not hasattr(msg, 'uncertainty') or msg.uncertainty is None:
+            continue
+        
+        # Extract U_i
+        ui = msg.uncertainty.get('normalized_entropy', 0.0)
+        
+        # Extract Da
+        da = msg.da_score if hasattr(msg, 'da_score') else None
+        
+        # Extract Do (split by type)
+        do_agent = None
+        do_user = None
+        if hasattr(msg, 'do_score') and msg.do_score is not None:
+            if hasattr(msg, 'do_type'):
+                if msg.do_type == 'agent_coherence':
+                    do_agent = msg.do_score
+                elif msg.do_type == 'user_coherence':
+                    do_user = msg.do_score
+        
+        step_data.append({
+            'ui': ui,
+            'da': da,
+            'do_agent': do_agent,
+            'do_user': do_user
+        })
+    
+    return calculate_saup_score(step_data, config)
 

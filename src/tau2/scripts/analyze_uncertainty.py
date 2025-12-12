@@ -37,7 +37,12 @@ from rich.console import Console
 from rich.table import Table
 
 from tau2.data_model.simulation import Results
-from tau2.metrics.uncertainty import calculate_normalized_entropy, get_uncertainty_stats
+from tau2.metrics.uncertainty import (
+    SAUPConfig,
+    calculate_normalized_entropy,
+    calculate_saup_score,
+    get_uncertainty_stats,
+)
 
 
 class TurnUncertainty(BaseModel):
@@ -63,6 +68,8 @@ class SimulationUncertainty(BaseModel):
     turn_count: int
     uncertainty_scores: list[TurnUncertainty]
     summary: dict
+    saup_metrics: Optional[dict] = None
+    ground_truth_pass: Optional[bool] = None
 
 
 class UncertaintyAnalysis(BaseModel):
@@ -130,6 +137,26 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
 
         uncertainty_scores.append(turn_data)
 
+    # Calculate SAUP-D aggregation score
+    saup_metrics = None
+    if uncertainty_scores:
+        step_data = [
+            {
+                "ui": turn.ui_score,
+                "da": turn.da_score,
+                "do_agent": turn.do_score if turn.do_type == "agent_coherence" else None,
+                "do_user": turn.do_score if turn.do_type == "user_coherence" else None
+            }
+            for turn in uncertainty_scores
+        ]
+        saup_result = calculate_saup_score(step_data, SAUPConfig())
+        # Remove weights list (too verbose)
+        saup_metrics = {k: v for k, v in saup_result.items() if k != 'weights'}
+    
+    # Extract ground truth (task success)
+    ground_truth = simulation.get("reward_info", {}).get("reward", None) if simulation.get("reward_info") else None
+    ground_truth_pass = ground_truth == 1.0 if ground_truth is not None else None
+
     # Calculate summary statistics
     summary = {}
     if uncertainty_scores:
@@ -171,6 +198,8 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
         turn_count=len(uncertainty_scores),
         uncertainty_scores=uncertainty_scores,
         summary=summary,
+        saup_metrics=saup_metrics,
+        ground_truth_pass=ground_truth_pass,
     )
 
 
@@ -321,6 +350,42 @@ def print_uncertainty_summary_from_results(
                 console.print(f"    Mean: {np.mean(all_do_user):.4f}")
                 console.print(f"    Count: {len(all_do_user)}")
     
+    # SAUP-D Aggregation Scores
+    all_saup_scores = []
+    saup_passed = []
+    saup_failed = []
+    
+    for sim in results.simulations:
+        if hasattr(sim, 'saup_metrics') and sim.saup_metrics is not None:
+            saup_score = sim.saup_metrics.get('saup_score')
+            if saup_score is not None:
+                all_saup_scores.append(saup_score)
+                
+                # Track by ground truth
+                if hasattr(sim, 'reward_info') and sim.reward_info is not None:
+                    reward = sim.reward_info.reward
+                    if reward == 1.0:
+                        saup_passed.append(saup_score)
+                    else:
+                        saup_failed.append(saup_score)
+    
+    if all_saup_scores:
+        console.print("\n[bold cyan]SAUP-D Aggregation Scores[/bold cyan]")
+        console.print(f"  Mean SAUP: {np.mean(all_saup_scores):.4f}")
+        console.print(f"  Std SAUP:  {np.std(all_saup_scores):.4f}")
+        console.print(f"  Min SAUP:  {np.min(all_saup_scores):.4f}")
+        console.print(f"  Max SAUP:  {np.max(all_saup_scores):.4f}")
+        console.print(f"  Total simulations: {len(all_saup_scores)}")
+        
+        # Ground truth correlation
+        if saup_passed or saup_failed:
+            total_with_gt = len(saup_passed) + len(saup_failed)
+            console.print(f"\n  Ground Truth: {len(saup_passed)}/{total_with_gt} passed ({100*len(saup_passed)/total_with_gt:.1f}%)")
+            if saup_passed:
+                console.print(f"  Mean SAUP (passed): {np.mean(saup_passed):.4f}")
+            if saup_failed:
+                console.print(f"  Mean SAUP (failed): {np.mean(saup_failed):.4f}")
+    
     # Per-simulation summary (first 3)
     console.print("\n[bold cyan]Per-Simulation Summary[/bold cyan] (showing first 3)\n")
     for i, sim in enumerate(results.simulations[:3]):
@@ -443,6 +508,41 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                 console.print(f"\n  [dim]User Coherence:[/dim]")
                 console.print(f"    Mean: {np.mean(all_do_user):.4f}")
                 console.print(f"    Count: {len(all_do_user)}")
+    
+    # SAUP-D Aggregation Scores
+    all_saup_scores = []
+    saup_passed = []
+    saup_failed = []
+    
+    for sim in analysis.results:
+        if sim.saup_metrics is not None:
+            saup_score = sim.saup_metrics.get('saup_score')
+            if saup_score is not None:
+                all_saup_scores.append(saup_score)
+                
+                # Track by ground truth
+                if sim.ground_truth_pass is not None:
+                    if sim.ground_truth_pass:
+                        saup_passed.append(saup_score)
+                    else:
+                        saup_failed.append(saup_score)
+    
+    if all_saup_scores:
+        console.print("\n[bold cyan]SAUP-D Aggregation Scores[/bold cyan]")
+        console.print(f"  Mean SAUP: {np.mean(all_saup_scores):.4f}")
+        console.print(f"  Std SAUP:  {np.std(all_saup_scores):.4f}")
+        console.print(f"  Min SAUP:  {np.min(all_saup_scores):.4f}")
+        console.print(f"  Max SAUP:  {np.max(all_saup_scores):.4f}")
+        console.print(f"  Total simulations: {len(all_saup_scores)}")
+        
+        # Ground truth correlation
+        if saup_passed or saup_failed:
+            total_with_gt = len(saup_passed) + len(saup_failed)
+            console.print(f"\n  Ground Truth: {len(saup_passed)}/{total_with_gt} passed ({100*len(saup_passed)/total_with_gt:.1f}%)")
+            if saup_passed:
+                console.print(f"  Mean SAUP (passed): {np.mean(saup_passed):.4f}")
+            if saup_failed:
+                console.print(f"  Mean SAUP (failed): {np.mean(saup_failed):.4f}")
 
     # Per-simulation summary
     console.print("\n[bold cyan]Per-Simulation Summary[/bold cyan]\n")
@@ -457,8 +557,15 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
             f"  Mean uncertainty (agent):   {summary.get('mean_uncertainty_agent', 0):.4f}"
         )
         console.print(
-            f"  Mean uncertainty (user):    {summary.get('mean_uncertainty_user', 0):.4f}\n"
+            f"  Mean uncertainty (user):    {summary.get('mean_uncertainty_user', 0):.4f}"
         )
+        
+        # Display SAUP score if available
+        if sim.saup_metrics:
+            console.print(f"  SAUP Score: {sim.saup_metrics['saup_score']:.4f}")
+            console.print(f"  Ground Truth: {'✅ Pass' if sim.ground_truth_pass else '❌ Fail' if sim.ground_truth_pass is not None else 'N/A'}\n")
+        else:
+            console.print()
 
     if len(analysis.results) > 5:
         console.print(f"... and {len(analysis.results) - 5} more simulations\n")
@@ -488,19 +595,40 @@ def print_detailed_trajectory(
     console.print(f"\n[bold]Simulation ID:[/bold] {sim.simulation_id}")
     console.print(f"[bold]Task ID:[/bold] {sim.task_id}")
     console.print(f"[bold]Trial:[/bold] {sim.trial}")
-    console.print(f"[bold]Total Turns:[/bold] {sim.turn_count}\n")
+    console.print(f"[bold]Total Turns:[/bold] {sim.turn_count}")
+    
+    # Display SAUP score if available
+    if sim.saup_metrics:
+        console.print(f"[bold]SAUP Score:[/bold] {sim.saup_metrics['saup_score']:.4f}")
+        console.print(f"[bold]Ground Truth:[/bold] {'✅ Pass' if sim.ground_truth_pass else '❌ Fail' if sim.ground_truth_pass is not None else 'N/A'}")
+    console.print()
+
+    # Calculate weights for display
+    weights = []
+    if sim.saup_metrics:
+        config = SAUPConfig()
+        for score in sim.uncertainty_scores:
+            from tau2.metrics.uncertainty import calculate_situational_weight
+            w = calculate_situational_weight(
+                score.da_score,
+                score.do_score if score.do_type == "agent_coherence" else None,
+                score.do_score if score.do_type == "user_coherence" else None,
+                config
+            )
+            weights.append(w)
 
     # Create table
     table = Table(show_header=True, header_style="bold cyan")
-    table.add_column("Turn", style="dim", width=6)
-    table.add_column("Actor", width=10)
-    table.add_column("U_i", justify="right", width=10)
-    table.add_column("Da", justify="right", width=10)
-    table.add_column("Do", justify="right", width=10)
-    table.add_column("Do Type", width=12)
-    table.add_column("Content Preview", width=40)
+    table.add_column("Turn", style="dim", width=5)
+    table.add_column("Actor", width=8)
+    table.add_column("U_i", justify="right", width=8)
+    table.add_column("Da", justify="right", width=8)
+    table.add_column("Do", justify="right", width=8)
+    table.add_column("W_i", justify="right", width=8)
+    table.add_column("Do Type", width=10)
+    table.add_column("Content", width=35)
 
-    for score in sim.uncertainty_scores:
+    for idx, score in enumerate(sim.uncertainty_scores):
         # Color code by uncertainty level
         if score.ui_score < 0.1:
             ui_color = "green"
@@ -518,7 +646,7 @@ def print_detailed_trajectory(
                 da_color = "yellow"
             else:
                 da_color = "red"
-            da_str = f"[{da_color}]{score.da_score:.4f}[/{da_color}]"
+            da_str = f"[{da_color}]{score.da_score:.3f}[/{da_color}]"
         
         # Color code Do (inference gap)
         do_str = "—"
@@ -529,18 +657,31 @@ def print_detailed_trajectory(
                 do_color = "yellow"
             else:
                 do_color = "red"
-            do_str = f"[{do_color}]{score.do_score:.4f}[/{do_color}]"
+            do_str = f"[{do_color}]{score.do_score:.3f}[/{do_color}]"
         
-        do_type_str = score.do_type if score.do_type else "—"
+        # Display weight if available
+        w_str = "—"
+        if weights and idx < len(weights):
+            w = weights[idx]
+            if w < 0.3:
+                w_color = "green"
+            elif w < 0.6:
+                w_color = "yellow"
+            else:
+                w_color = "red"
+            w_str = f"[{w_color}]{w:.3f}[/{w_color}]"
+        
+        do_type_str = score.do_type[:10] if score.do_type else "—"
 
         table.add_row(
             str(score.turn),
             score.actor,
-            f"[{ui_color}]{score.ui_score:.4f}[/{ui_color}]",
+            f"[{ui_color}]{score.ui_score:.3f}[/{ui_color}]",
             da_str,
             do_str,
+            w_str,
             do_type_str,
-            score.content_preview[:40] + "...",
+            score.content_preview[:35] + "...",
         )
 
     console.print(table)
@@ -584,6 +725,12 @@ def main():
         "--no-save",
         action="store_true",
         help="Do not save results to file",
+    )
+    parser.add_argument(
+        "--saup-config",
+        type=json.loads,
+        default='{"alpha": 1.0, "beta": 1.0, "gamma": 1.0}',
+        help='SAUP-D weight configuration (JSON format, e.g., \'{"alpha": 1.0, "beta": 1.0, "gamma": 1.0}\')',
     )
 
     args = parser.parse_args()
