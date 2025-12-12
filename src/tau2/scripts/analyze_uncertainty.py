@@ -44,6 +44,20 @@ from tau2.metrics.uncertainty import (
     get_uncertainty_stats,
 )
 
+# Optional sklearn import for AUROC calculation
+try:
+    from sklearn.metrics import (
+        accuracy_score,
+        precision_score,
+        recall_score,
+        roc_auc_score,
+        roc_curve,
+    )
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    logger.warning("scikit-learn not available. AUROC evaluation will be skipped.")
+
 
 class TurnUncertainty(BaseModel):
     """Uncertainty information for a single turn."""
@@ -72,11 +86,30 @@ class SimulationUncertainty(BaseModel):
     ground_truth_pass: Optional[bool] = None
 
 
+class AUROCMetrics(BaseModel):
+    """AUROC evaluation metrics for failure prediction."""
+    
+    auroc: float
+    accuracy: float
+    precision: float
+    recall: float
+    f1_score: float
+    optimal_threshold: float
+    num_samples: int
+    num_failures: int
+    num_successes: int
+    mean_saup_failures: float
+    mean_saup_successes: float
+    std_saup_failures: float
+    std_saup_successes: float
+
+
 class UncertaintyAnalysis(BaseModel):
     """Complete uncertainty analysis results."""
 
     metadata: dict
     results: list[SimulationUncertainty]
+    auroc_metrics: Optional[AUROCMetrics] = None
 
 
 def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUncertainty:
@@ -203,13 +236,110 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
     )
 
 
-def analyze_results(results: Results, verbose: bool = False) -> UncertaintyAnalysis:
+def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optional[AUROCMetrics]:
+    """
+    Calculate AUROC metrics for SAUP-D failure prediction.
+    
+    Hypothesis: High SAUP-D score predicts task failure.
+    Label encoding: Failure=1, Success=0
+    
+    Args:
+        analyzed_sims: List of analyzed simulations with SAUP metrics
+        
+    Returns:
+        AUROCMetrics if calculation successful, None otherwise
+    """
+    if not SKLEARN_AVAILABLE:
+        logger.warning("scikit-learn not available. Skipping AUROC calculation.")
+        return None
+    
+    # Extract SAUP scores and ground truth labels
+    y_scores = []
+    y_true = []
+    
+    for sim in analyzed_sims:
+        # Need both SAUP score and ground truth
+        if sim.saup_metrics is None or sim.ground_truth_pass is None:
+            continue
+        
+        saup_score = sim.saup_metrics.get('saup_score')
+        if saup_score is None:
+            continue
+        
+        # Label encoding: Failure=1, Success=0
+        ground_truth = 0 if sim.ground_truth_pass else 1
+        
+        y_scores.append(saup_score)
+        y_true.append(ground_truth)
+    
+    # Need at least 2 samples and both classes present
+    if len(y_scores) < 2:
+        logger.warning(f"Not enough samples for AUROC ({len(y_scores)} < 2). Skipping.")
+        return None
+    
+    y_scores = np.array(y_scores)
+    y_true = np.array(y_true)
+    
+    unique_labels = np.unique(y_true)
+    if len(unique_labels) < 2:
+        logger.warning(f"Only one class present in data: {unique_labels}. Cannot calculate AUROC.")
+        return None
+    
+    try:
+        # Calculate AUROC
+        auroc = roc_auc_score(y_true, y_scores)
+        
+        # Find optimal threshold using Youden's J statistic
+        fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+        j_scores = tpr - fpr
+        optimal_idx = np.argmax(j_scores)
+        optimal_threshold = thresholds[optimal_idx]
+        
+        # Calculate metrics at optimal threshold
+        y_pred = (y_scores >= optimal_threshold).astype(int)
+        
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        
+        # F1 score
+        if precision + recall > 0:
+            f1_score = 2 * (precision * recall) / (precision + recall)
+        else:
+            f1_score = 0.0
+        
+        # Statistics by class
+        failures = y_scores[y_true == 1]
+        successes = y_scores[y_true == 0]
+        
+        return AUROCMetrics(
+            auroc=float(auroc),
+            accuracy=float(accuracy),
+            precision=float(precision),
+            recall=float(recall),
+            f1_score=float(f1_score),
+            optimal_threshold=float(optimal_threshold),
+            num_samples=len(y_scores),
+            num_failures=int(np.sum(y_true == 1)),
+            num_successes=int(np.sum(y_true == 0)),
+            mean_saup_failures=float(np.mean(failures)) if len(failures) > 0 else 0.0,
+            mean_saup_successes=float(np.mean(successes)) if len(successes) > 0 else 0.0,
+            std_saup_failures=float(np.std(failures)) if len(failures) > 0 else 0.0,
+            std_saup_successes=float(np.std(successes)) if len(successes) > 0 else 0.0,
+        )
+    except Exception as e:
+        logger.error(f"Failed to calculate AUROC: {e}")
+        return None
+
+
+def analyze_results(results: Results, verbose: bool = False, calculate_auroc: bool = True) -> UncertaintyAnalysis:
     """
     Analyze all simulations in the results.
 
     Args:
         results: Tau-2 simulation results
         verbose: If True, include detailed statistics
+        calculate_auroc: If True, calculate AUROC metrics for failure prediction
 
     Returns:
         UncertaintyAnalysis: Complete analysis results
@@ -229,8 +359,17 @@ def analyze_results(results: Results, verbose: bool = False) -> UncertaintyAnaly
         "agent_llm": results.info.agent_info.llm,
         "user_llm": results.info.user_info.llm,
     }
+    
+    # Calculate AUROC metrics if requested and SAUP scores are available
+    auroc_metrics = None
+    if calculate_auroc:
+        auroc_metrics = calculate_auroc_metrics(analyzed_sims)
 
-    return UncertaintyAnalysis(metadata=metadata, results=analyzed_sims)
+    return UncertaintyAnalysis(
+        metadata=metadata,
+        results=analyzed_sims,
+        auroc_metrics=auroc_metrics
+    )
 
 
 def print_uncertainty_summary_from_results(
@@ -385,6 +524,18 @@ def print_uncertainty_summary_from_results(
                 console.print(f"  Mean SAUP (passed): {np.mean(saup_passed):.4f}")
             if saup_failed:
                 console.print(f"  Mean SAUP (failed): {np.mean(saup_failed):.4f}")
+            
+            # Quick AUROC estimate (inline calculation for real-time summary)
+            if SKLEARN_AVAILABLE and len(saup_passed) > 0 and len(saup_failed) > 0:
+                try:
+                    y_scores_inline = np.array(saup_passed + saup_failed)
+                    y_true_inline = np.array([0]*len(saup_passed) + [1]*len(saup_failed))
+                    auroc_inline = roc_auc_score(y_true_inline, y_scores_inline)
+                    
+                    auroc_color = "green" if auroc_inline > 0.7 else "yellow" if auroc_inline > 0.6 else "red"
+                    console.print(f"\n  Quick AUROC: [{auroc_color}]{auroc_inline:.4f}[/{auroc_color}]")
+                except Exception:
+                    pass  # Silently skip if calculation fails
     
     # Per-simulation summary (first 3)
     console.print("\n[bold cyan]Per-Simulation Summary[/bold cyan] (showing first 3)\n")
@@ -543,6 +694,54 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                 console.print(f"  Mean SAUP (passed): {np.mean(saup_passed):.4f}")
             if saup_failed:
                 console.print(f"  Mean SAUP (failed): {np.mean(saup_failed):.4f}")
+    
+    # AUROC Evaluation (Failure Prediction)
+    if analysis.auroc_metrics is not None:
+        auroc = analysis.auroc_metrics
+        console.print("\n[bold cyan]AUROC Evaluation (Failure Prediction)[/bold cyan]")
+        console.print(f"  Hypothesis: High SAUP-D → High probability of failure")
+        console.print(f"  Dataset: {auroc.num_samples} tasks ({auroc.num_failures} failures, {auroc.num_successes} successes)")
+        console.print()
+        
+        # AUROC interpretation
+        auroc_value = auroc.auroc
+        if auroc_value > 0.9:
+            auroc_color = "green"
+            auroc_label = "Excellent"
+        elif auroc_value > 0.8:
+            auroc_color = "green"
+            auroc_label = "Good"
+        elif auroc_value > 0.7:
+            auroc_color = "yellow"
+            auroc_label = "Fair"
+        elif auroc_value > 0.6:
+            auroc_color = "yellow"
+            auroc_label = "Poor"
+        else:
+            auroc_color = "red"
+            auroc_label = "Very Poor"
+        
+        console.print(f"  AUROC: [{auroc_color}]{auroc_value:.4f}[/{auroc_color}] ({auroc_label})")
+        console.print(f"  Optimal Threshold: {auroc.optimal_threshold:.4f}")
+        console.print(f"  Accuracy: {auroc.accuracy:.4f}")
+        console.print(f"  Precision: {auroc.precision:.4f}")
+        console.print(f"  Recall: {auroc.recall:.4f}")
+        console.print(f"  F1 Score: {auroc.f1_score:.4f}")
+        
+        # Interpretation
+        console.print()
+        if auroc_value > 0.7:
+            console.print(f"  [green]✅ SAUP-D has {auroc_label.lower()} predictive power for task failure![/green]")
+            console.print(f"  [green]   Tasks with SAUP-D > {auroc.optimal_threshold:.4f} are at high risk of failure.[/green]")
+        elif auroc_value > 0.6:
+            console.print(f"  [yellow]⚠️  SAUP-D shows fair predictive power (AUROC={auroc_value:.4f}).[/yellow]")
+            console.print(f"  [yellow]   Consider combining with other features or tuning α,β,γ weights.[/yellow]")
+        else:
+            console.print(f"  [red]❌ SAUP-D shows poor predictive power (AUROC={auroc_value:.4f}).[/red]")
+            if auroc.num_samples < 30:
+                console.print(f"  [yellow]   Note: Small sample size ({auroc.num_samples}) limits statistical power.[/yellow]")
+            else:
+                console.print(f"  [yellow]   The hypothesis may not hold for this dataset/configuration.[/yellow]")
 
     # Per-simulation summary
     console.print("\n[bold cyan]Per-Simulation Summary[/bold cyan]\n")
@@ -732,6 +931,11 @@ def main():
         default='{"alpha": 1.0, "beta": 1.0, "gamma": 1.0}',
         help='SAUP-D weight configuration (JSON format, e.g., \'{"alpha": 1.0, "beta": 1.0, "gamma": 1.0}\')',
     )
+    parser.add_argument(
+        "--no-auroc",
+        action="store_true",
+        help="Skip AUROC calculation (useful if ground truth not available)",
+    )
 
     args = parser.parse_args()
 
@@ -754,7 +958,11 @@ def main():
 
         # Analyze
         console.print("[cyan]🔄 Analyzing trajectories and calculating uncertainty scores...[/cyan]")
-        analysis = analyze_results(results, verbose=args.verbose)
+        analysis = analyze_results(
+            results,
+            verbose=args.verbose,
+            calculate_auroc=not args.no_auroc
+        )
 
         # Print summary
         print_summary(analysis, console)

@@ -327,7 +327,7 @@ def run_tasks(
             with open(save_to, "w") as fp:
                 json.dump(ckpt, fp, indent=2)
 
-    def _run(task: Task, trial: int, seed: int, progress_str: str) -> SimulationRun:
+    def _run(task: Task, trial: int, seed: int, progress_str: str) -> Optional[SimulationRun]:
         console_text = Text(
             text=f"{progress_str}. Running task {task.id}, trial {trial + 1}",
             style="bold green",
@@ -353,10 +353,17 @@ def run_tasks(
             if console_display:
                 ConsoleDisplay.display_simulation(simulation, show_details=False)
             _save(simulation)
+            return simulation
         except Exception as e:
             logger.error(f"Error running task {task.id}, trial {trial}: {e}")
-            raise e
-        return simulation
+            # Log failure but continue with next task
+            console_text = Text(
+                text=f"❌ Task {task.id} (trial {trial + 1}) failed: {str(e)[:100]}",
+                style="bold red",
+            )
+            ConsoleDisplay.console.print(console_text)
+            # Return None to indicate failure - will be filtered out later
+            return None
 
     args = []
     for trial in range(num_trials):
@@ -373,9 +380,18 @@ def run_tasks(
 
     with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
         res = list(executor.map(_run, *zip(*args)))
-        simulation_results.simulations.extend(res)
+        # Filter out None values (failed tasks)
+        successful_simulations = [sim for sim in res if sim is not None]
+        simulation_results.simulations.extend(successful_simulations)
+        
+    # Report results
+    num_failed = len(res) - len(successful_simulations)
+    if num_failed > 0:
+        ConsoleDisplay.console.print(
+            f"\n⚠️  [bold yellow]{num_failed} task(s) failed and were skipped[/bold yellow]"
+        )
     ConsoleDisplay.console.print(
-        "\n✨ [bold green]Successfully completed all simulations![/bold green]\n"
+        f"\n✨ [bold green]Successfully completed {len(successful_simulations)}/{len(res)} simulations![/bold green]\n"
         "To review the simulations, run: [bold blue]tau2 view[/bold blue]"
     )
     
@@ -428,6 +444,20 @@ def run_task(
         raise ValueError("Max steps must be greater than 0")
     if max_errors <= 0:
         raise ValueError("Max errors must be greater than 0")
+    
+    # Enable logprobs when calculate_uncertainty is True
+    # This is needed for uncertainty calculations (U_i from token probabilities)
+    if calculate_uncertainty:
+        # Make copies to avoid modifying the original dicts
+        llm_args_agent = dict(llm_args_agent) if llm_args_agent else {}
+        llm_args_user = dict(llm_args_user) if llm_args_user else {}
+        # Only set logprobs if not already specified
+        if "logprobs" not in llm_args_agent:
+            llm_args_agent["logprobs"] = True
+        if "logprobs" not in llm_args_user:
+            llm_args_user["logprobs"] = True
+        logger.info("Enabled logprobs for uncertainty calculation")
+    
     global registry
     logger.info(
         f"STARTING SIMULATION: Domain: {domain}, Task: {task.id}, Agent: {agent}, User: {user}"

@@ -10,9 +10,10 @@
 # Using your Gemini/Vertex AI models
 tau2 run \
   --domain airline \
-  --num-tasks 2 \
+  --num-tasks 50 \
   --num-trials 1 \
-  --max-steps 5 \
+  --max-steps 50 \
+  --max-errors 5 \
   --agent-llm vertex_ai/gemini-2.5-flash \
   --user-llm vertex_ai/gemini-2.5-flash \
 ```
@@ -22,8 +23,11 @@ tau2 run \
 ```bash
 tau2 run \
   --domain airline \
-  --num-tasks 2 \
+  --num-tasks 50 \
   --num-trials 1 \
+  --max-steps 50 \
+  --max-errors 5 \
+  --max-concurrency 2 \
   --agent-llm vertex_ai/gemini-2.5-flash \
   --user-llm vertex_ai/gemini-2.5-flash \
   --calculate-uncertainty
@@ -65,9 +69,14 @@ python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-
 # Custom SAUP-D configuration (adjust α, β, γ weights)
 python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
   --saup-config '{"alpha": 2.0, "beta": 1.0, "gamma": 0.5}'
+
+# Skip AUROC calculation (if ground truth not available)
+python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-auroc
 ```
 
 **Note**: By default, results are automatically saved to `data/uncertainty/` with the same filename as your simulation file for easy cross-referencing.
+
+**AUROC Calculation**: The script automatically calculates AUROC (Area Under ROC Curve) to evaluate whether SAUP-D scores predict task failure. Requires both SAUP scores and ground truth (reward) data.
 
 ### Batch Process All Simulations
 ```bash
@@ -80,6 +89,8 @@ python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
 # With detailed view for each
 ./scripts/batch_analyze_uncertainty.sh --detailed
 ```
+
+**Note on AUROC**: The uncertainty analysis script automatically calculates AUROC (Area Under ROC Curve) to evaluate whether SAUP-D scores can predict task failure. This is included in the standard analysis output when both SAUP scores and ground truth data are available.
 
 ## 📝 Code Examples
 
@@ -278,6 +289,7 @@ for sim_file in sim_dir.glob("*.json"):
 |------|-------|
 | Core metrics (U_i, Da, Do) | `src/tau2/metrics/uncertainty.py` |
 | SAUP-D aggregation | `src/tau2/metrics/uncertainty.py` |
+| AUROC evaluation | `src/tau2/scripts/analyze_uncertainty.py` |
 | Real-time calculation | `src/tau2/orchestrator/orchestrator.py` |
 | Data models (messages) | `src/tau2/data_model/message.py` |
 | Data models (simulations) | `src/tau2/data_model/simulation.py` |
@@ -368,6 +380,25 @@ Where `W_i = α·Da + β·Do_agent + γ·Do_user` (default: α=β=γ=1.0)
 - Compare passed vs failed tasks to find predictive thresholds
 - Adjust α, β, γ weights based on domain importance
 
+### AUROC (Predictive Power)
+
+AUROC measures how well SAUP-D scores predict task failure (1.0 = perfect, 0.5 = random):
+
+| AUROC Range | Interpretation | Recommendation |
+|-------------|----------------|----------------|
+| 0.90 - 1.00 | Excellent | Deploy SAUP-D for failure prediction |
+| 0.80 - 0.90 | Good | Use with confidence monitoring |
+| 0.70 - 0.80 | Fair | Combine with other signals |
+| 0.60 - 0.70 | Poor | Tune α,β,γ or collect more data |
+| < 0.60 | Very poor | Hypothesis may not hold |
+
+**Interpretation Tips**:
+- AUROC > 0.7 → SAUP-D can reliably predict failures
+- Use optimal threshold from evaluation to flag risky tasks
+- Compare mean SAUP scores for passed vs failed to validate
+- Need 50+ samples for statistically robust AUROC
+- **Automatically calculated** when analyzing sims with ground truth data
+
 ## 🐛 Troubleshooting
 
 ### Import Error: "No module named 'tau2'"
@@ -406,7 +437,10 @@ PYTHONPATH=src python -m tau2.scripts.analyze_uncertainty simulation.json
 8. **Combined Analysis**: Look at U_i + Da + Do together for complete picture
 9. **SAUP-D Scores**: Use trajectory-level SAUP-D score to compare models and predict task outcomes
 10. **Custom Weights**: Adjust α, β, γ based on what matters in your domain (e.g., α=2.0 to emphasize goal-tracking)
-11. **Failure Prediction**: Compare mean SAUP-D for passed vs failed tasks to find predictive thresholds
+11. **Failure Prediction**: AUROC is automatically calculated when you analyze simulations with ground truth
+12. **Threshold Tuning**: Check the optimal_threshold in AUROC metrics to find your failure cutoff
+13. **Statistical Power**: Need 50+ samples for robust AUROC; combine multiple benchmark runs
+14. **Interpret AUROC**: AUROC > 0.7 = good predictor, < 0.6 = poor (may need different weights)
 
 ## 📈 Common Analysis Patterns
 
@@ -521,6 +555,39 @@ for sim in results.simulations:
     print(f"Task {sim.task_id}:")
     print(f"  Default:  {saup_default['saup_score']:.4f}")
     print(f"  High Da:  {saup_high_da['saup_score']:.4f}")
+```
+
+### Access AUROC Metrics (Failure Prediction)
+```python
+import json
+from pathlib import Path
+
+# Load analysis results (includes AUROC automatically)
+with open('data/uncertainty/your_analysis.json', 'r') as f:
+    analysis = json.load(f)
+
+# Access AUROC metrics
+if analysis.get('auroc_metrics'):
+    auroc = analysis['auroc_metrics']
+    print(f"AUROC: {auroc['auroc']:.4f}")
+    print(f"Accuracy: {auroc['accuracy']:.4f}")
+    print(f"Optimal threshold: {auroc['optimal_threshold']:.4f}")
+    print(f"Precision: {auroc['precision']:.4f}")
+    print(f"Recall: {auroc['recall']:.4f}")
+    print(f"F1 Score: {auroc['f1_score']:.4f}")
+    
+    # Check if SAUP-D is predictive
+    if auroc['auroc'] > 0.7:
+        print(f"✅ SAUP-D has good predictive power!")
+        print(f"Flag tasks with SAUP-D > {auroc['optimal_threshold']:.4f}")
+    else:
+        print(f"⚠️  SAUP-D needs more data or weight tuning")
+    
+    # Score distributions
+    print(f"\nFailed tasks: SAUP = {auroc['mean_saup_failures']:.4f}")
+    print(f"Passed tasks: SAUP = {auroc['mean_saup_successes']:.4f}")
+else:
+    print("No AUROC metrics (need SAUP scores + ground truth)")
 ```
 
 ---
