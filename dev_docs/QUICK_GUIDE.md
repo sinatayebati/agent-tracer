@@ -10,9 +10,10 @@
 # Using your Gemini/Vertex AI models
 tau2 run \
   --domain airline \
-  --num-tasks 2 \
+  --num-tasks 50 \
   --num-trials 1 \
-  --max-steps 5 \
+  --max-steps 50 \
+  --max-errors 5 \
   --agent-llm vertex_ai/gemini-2.5-flash \
   --user-llm vertex_ai/gemini-2.5-flash \
 ```
@@ -22,8 +23,11 @@ tau2 run \
 ```bash
 tau2 run \
   --domain airline \
-  --num-tasks 2 \
+  --num-tasks 50 \
   --num-trials 1 \
+  --max-steps 50 \
+  --max-errors 5 \
+  --max-concurrency 2 \
   --agent-llm vertex_ai/gemini-2.5-flash \
   --user-llm vertex_ai/gemini-2.5-flash \
   --calculate-uncertainty
@@ -33,6 +37,7 @@ tau2 run \
 - **U_i**: Single-step uncertainty (token-level confidence)
 - **Da**: Inquiry Drift (semantic distance from goal)
 - **Do**: Inference Gap (action-observation coherence)
+- **SAUP-D Score**: Trajectory-level aggregation of all metrics (weighted RMS)
 
 ### Run separate uncertainty tests
 ```bash
@@ -60,9 +65,18 @@ python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
 
 # Don't save, just display results
 python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-save
+
+# Custom SAUP-D configuration (adjust α, β, γ weights)
+python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
+  --saup-config '{"alpha": 2.0, "beta": 1.0, "gamma": 0.5}'
+
+# Skip AUROC calculation (if ground truth not available)
+python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-auroc
 ```
 
 **Note**: By default, results are automatically saved to `data/uncertainty/` with the same filename as your simulation file for easy cross-referencing.
+
+**AUROC Calculation**: The script automatically calculates AUROC (Area Under ROC Curve) to evaluate whether SAUP-D scores predict task failure. Requires both SAUP scores and ground truth (reward) data.
 
 ### Batch Process All Simulations
 ```bash
@@ -75,6 +89,8 @@ python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-
 # With detailed view for each
 ./scripts/batch_analyze_uncertainty.sh --detailed
 ```
+
+**Note on AUROC**: The uncertainty analysis script automatically calculates AUROC (Area Under ROC Curve) to evaluate whether SAUP-D scores can predict task failure. This is included in the standard analysis output when both SAUP scores and ground truth data are available.
 
 ## 📝 Code Examples
 
@@ -133,6 +149,30 @@ do_score = calculate_inference_gap(agent_request, user_response)
 print(f"User Coherence (Do): {do_score:.4f}")
 ```
 
+### Calculate SAUP-D Trajectory Score
+
+```python
+from tau2.metrics.uncertainty import SAUPConfig, calculate_saup_score
+
+# Step data with all metrics
+steps = [
+    {'ui': 0.1, 'da': 0.2, 'do_agent': 0.3, 'do_user': None},
+    {'ui': 0.15, 'da': 0.25, 'do_agent': None, 'do_user': 0.35},
+    {'ui': 0.2, 'da': 0.3, 'do_agent': 0.4, 'do_user': None}
+]
+
+# Calculate with default config (α=1.0, β=1.0, γ=1.0)
+result = calculate_saup_score(steps)
+print(f"SAUP-D Score: {result['saup_score']:.4f}")
+print(f"Mean Weight: {result['mean_weight']:.4f}")
+print(f"Steps: {result['num_steps']}")
+
+# Calculate with custom weights
+config = SAUPConfig(alpha=2.0, beta=1.0, gamma=0.5)
+result = calculate_saup_score(steps, config)
+print(f"SAUP-D Score (custom): {result['saup_score']:.4f}")
+```
+
 ### Get Detailed Uncertainty Statistics
 
 ```python
@@ -155,8 +195,20 @@ from tau2.data_model.simulation import Results
 # Load simulation (run with --calculate-uncertainty)
 results = Results.load("data/simulations/your_file.json")
 
-# Access all embedded metrics
+# Access SAUP-D trajectory score
 for sim in results.simulations:
+    if sim.saup_metrics:
+        print(f"Task {sim.task_id}:")
+        print(f"  SAUP-D Score: {sim.saup_metrics['saup_score']:.4f}")
+        print(f"  Mean Weight: {sim.saup_metrics['mean_weight']:.4f}")
+        print(f"  Steps: {sim.saup_metrics['num_steps']}")
+        
+        # Ground truth correlation
+        if sim.reward_info:
+            status = "✅ Pass" if sim.reward_info.reward == 1.0 else "❌ Fail"
+            print(f"  Result: {status}")
+    
+    # Access step-level metrics
     for msg in sim.messages:
         # Single-step uncertainty (U_i)
         if msg.uncertainty is not None:
@@ -236,8 +288,11 @@ for sim_file in sim_dir.glob("*.json"):
 | What | Where |
 |------|-------|
 | Core metrics (U_i, Da, Do) | `src/tau2/metrics/uncertainty.py` |
+| SAUP-D aggregation | `src/tau2/metrics/uncertainty.py` |
+| AUROC evaluation | `src/tau2/scripts/analyze_uncertainty.py` |
 | Real-time calculation | `src/tau2/orchestrator/orchestrator.py` |
-| Data models | `src/tau2/data_model/message.py` |
+| Data models (messages) | `src/tau2/data_model/message.py` |
+| Data models (simulations) | `src/tau2/data_model/simulation.py` |
 | CLI analysis tool | `src/tau2/scripts/analyze_uncertainty.py` |
 | Tests (pytest) | `tests/test_uncertainty.py` |
 | Tests (simple) | `tests/run_uncertainty_tests.py` |
@@ -258,6 +313,14 @@ from tau2.metrics.uncertainty import (
     calculate_inference_gap,
     calculate_semantic_distance,
     EmbeddingService,
+)
+
+# Import SAUP-D aggregation functions
+from tau2.metrics.uncertainty import (
+    SAUPConfig,
+    calculate_situational_weight,
+    calculate_saup_score,
+    calculate_saup_from_trajectory,
 )
 
 # Import data models
@@ -296,6 +359,46 @@ from tau2.metrics.uncertainty import TokenUncertainty, UncertaintyStats
 - **agent_coherence**: Distance between agent's tool call and observation
 - **user_coherence**: Distance between agent's request and user's response
 
+### SAUP-D Score (Trajectory-Level)
+
+The SAUP-D score aggregates U_i, Da, and Do into a single trajectory score using weighted RMS:
+
+**Formula**: `SAUP-D = √[(1/N) · Σ(W_i · U_i)²]`
+
+Where `W_i = α·Da + β·Do_agent + γ·Do_user` (default: α=β=γ=1.0)
+
+| Range | Interpretation | Typical Scenarios |
+|-------|----------------|-------------------|
+| 0.00 - 0.10 | Very low uncertainty | Successful, confident trajectories |
+| 0.10 - 0.30 | Moderate uncertainty | Normal operation, some complexity |
+| 0.30 - 0.50 | High uncertainty | Challenging tasks, confusion |
+| > 0.50 | Very high uncertainty | Critical issues, likely failure |
+
+**Key Insights**:
+- Lower SAUP-D → More confident agent, better situational awareness
+- Higher SAUP-D → Less confident agent, poor situational awareness
+- Compare passed vs failed tasks to find predictive thresholds
+- Adjust α, β, γ weights based on domain importance
+
+### AUROC (Predictive Power)
+
+AUROC measures how well SAUP-D scores predict task failure (1.0 = perfect, 0.5 = random):
+
+| AUROC Range | Interpretation | Recommendation |
+|-------------|----------------|----------------|
+| 0.90 - 1.00 | Excellent | Deploy SAUP-D for failure prediction |
+| 0.80 - 0.90 | Good | Use with confidence monitoring |
+| 0.70 - 0.80 | Fair | Combine with other signals |
+| 0.60 - 0.70 | Poor | Tune α,β,γ or collect more data |
+| < 0.60 | Very poor | Hypothesis may not hold |
+
+**Interpretation Tips**:
+- AUROC > 0.7 → SAUP-D can reliably predict failures
+- Use optimal threshold from evaluation to flag risky tasks
+- Compare mean SAUP scores for passed vs failed to validate
+- Need 50+ samples for statistically robust AUROC
+- **Automatically calculated** when analyzing sims with ground truth data
+
 ## 🐛 Troubleshooting
 
 ### Import Error: "No module named 'tau2'"
@@ -332,6 +435,12 @@ PYTHONPATH=src python -m tau2.scripts.analyze_uncertainty simulation.json
 6. **Semantic Distance**: Use `--calculate-uncertainty` for Da/Do metrics (requires Vertex AI)
 7. **Cost Management**: Da/Do metrics require embedding API calls (~$0.0001 per call)
 8. **Combined Analysis**: Look at U_i + Da + Do together for complete picture
+9. **SAUP-D Scores**: Use trajectory-level SAUP-D score to compare models and predict task outcomes
+10. **Custom Weights**: Adjust α, β, γ based on what matters in your domain (e.g., α=2.0 to emphasize goal-tracking)
+11. **Failure Prediction**: AUROC is automatically calculated when you analyze simulations with ground truth
+12. **Threshold Tuning**: Check the optimal_threshold in AUROC metrics to find your failure cutoff
+13. **Statistical Power**: Need 50+ samples for robust AUROC; combine multiple benchmark runs
+14. **Interpret AUROC**: AUROC > 0.7 = good predictor, < 0.6 = poor (may need different weights)
 
 ## 📈 Common Analysis Patterns
 
@@ -403,30 +512,116 @@ for turn in sim.uncertainty_scores:
     print(f"{turn.turn:4d} | {turn.actor:5s} | {turn.ui_score:.3f} | {da} | {do} | {do_type}")
 ```
 
+### Analyze SAUP-D Scores Across Tasks
+```python
+from tau2.data_model.simulation import Results
+
+results = Results.load("data/simulations/your_file.json")
+
+# Collect SAUP scores by outcome
+passed_saup = []
+failed_saup = []
+
+for sim in results.simulations:
+    if sim.saup_metrics and sim.reward_info:
+        saup = sim.saup_metrics['saup_score']
+        if sim.reward_info.reward == 1.0:
+            passed_saup.append(saup)
+        else:
+            failed_saup.append(saup)
+
+# Compare
+import numpy as np
+print(f"Passed tasks - Mean SAUP: {np.mean(passed_saup):.4f}")
+print(f"Failed tasks - Mean SAUP: {np.mean(failed_saup):.4f}")
+print(f"Difference: {np.mean(failed_saup) - np.mean(passed_saup):.4f}")
+```
+
+### Custom SAUP-D Weighting
+```python
+from tau2.metrics.uncertainty import SAUPConfig, calculate_saup_from_trajectory
+
+# Emphasize inquiry drift (2x weight)
+config_high_da = SAUPConfig(alpha=2.0, beta=1.0, gamma=1.0)
+
+# Ignore user coherence (focus on agent)
+config_agent_only = SAUPConfig(alpha=1.0, beta=1.0, gamma=0.0)
+
+# Calculate with different configs
+for sim in results.simulations:
+    saup_default = calculate_saup_from_trajectory(sim.messages)
+    saup_high_da = calculate_saup_from_trajectory(sim.messages, config_high_da)
+    
+    print(f"Task {sim.task_id}:")
+    print(f"  Default:  {saup_default['saup_score']:.4f}")
+    print(f"  High Da:  {saup_high_da['saup_score']:.4f}")
+```
+
+### Access AUROC Metrics (Failure Prediction)
+```python
+import json
+from pathlib import Path
+
+# Load analysis results (includes AUROC automatically)
+with open('data/uncertainty/your_analysis.json', 'r') as f:
+    analysis = json.load(f)
+
+# Access AUROC metrics
+if analysis.get('auroc_metrics'):
+    auroc = analysis['auroc_metrics']
+    print(f"AUROC: {auroc['auroc']:.4f}")
+    print(f"Accuracy: {auroc['accuracy']:.4f}")
+    print(f"Optimal threshold: {auroc['optimal_threshold']:.4f}")
+    print(f"Precision: {auroc['precision']:.4f}")
+    print(f"Recall: {auroc['recall']:.4f}")
+    print(f"F1 Score: {auroc['f1_score']:.4f}")
+    
+    # Check if SAUP-D is predictive
+    if auroc['auroc'] > 0.7:
+        print(f"✅ SAUP-D has good predictive power!")
+        print(f"Flag tasks with SAUP-D > {auroc['optimal_threshold']:.4f}")
+    else:
+        print(f"⚠️  SAUP-D needs more data or weight tuning")
+    
+    # Score distributions
+    print(f"\nFailed tasks: SAUP = {auroc['mean_saup_failures']:.4f}")
+    print(f"Passed tasks: SAUP = {auroc['mean_saup_successes']:.4f}")
+else:
+    print("No AUROC metrics (need SAUP scores + ground truth)")
+```
+
 ---
 
 ## 🎓 Understanding the Metrics
 
-### The Three-Layer System
+### The Four-Layer SAUP System
 
 1. **U_i (Token-Level)**: How confident is the model when generating text?
 2. **Da (Goal-Level)**: Is the conversation drifting from the original goal?
 3. **Do (Action-Level)**: Do actions match their expected outcomes?
+4. **SAUP-D (Trajectory-Level)**: Overall uncertainty considering all factors
 
 ### When to Use Each Metric
 
 - **U_i alone**: Fast, real-time confidence monitoring
 - **Da + U_i**: Detect when uncertain model loses focus
 - **Do + U_i**: Detect when actions don't match expectations
-- **All three**: Complete situational awareness picture
+- **SAUP-D**: Single score to compare trajectories and predict outcomes
+- **All together**: Complete situational awareness picture
 
 ### Practical Interpretation
 
-**Scenario 1**: Low U_i, Low Da, Low Do = ✅ Perfect
-**Scenario 2**: High U_i, Low Da, Low Do = ⚠️ Uncertain but on track
-**Scenario 3**: Low U_i, High Da, Low Do = ⚠️ Confident but lost
-**Scenario 4**: Any High Do = 🚨 Coordination problem
-**Scenario 5**: All High = 🚨 Critical failure
+**Scenario 1**: Low U_i, Low Da, Low Do → Low SAUP-D = ✅ Perfect (score < 0.10)
+**Scenario 2**: High U_i, Low Da, Low Do → Moderate SAUP-D = ⚠️ Uncertain but on track (score 0.10-0.30)
+**Scenario 3**: Low U_i, High Da, Low Do → Moderate SAUP-D = ⚠️ Confident but lost (score 0.10-0.30)
+**Scenario 4**: Any High Do → High SAUP-D = 🚨 Coordination problem (score > 0.30)
+**Scenario 5**: All High → Very High SAUP-D = 🚨 Critical failure (score > 0.50)
+
+**Using SAUP-D for Decision Making**:
+- Set threshold based on your domain (e.g., 0.25)
+- If SAUP-D > threshold → Trigger intervention, human handoff, or retry
+- Track SAUP-D over time to detect degradation
+- Compare SAUP-D between different agent models or prompts
 
 ---
 

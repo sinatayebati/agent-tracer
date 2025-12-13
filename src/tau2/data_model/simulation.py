@@ -346,6 +346,10 @@ class SimulationRun(BaseModel):
     seed: Optional[int] = Field(
         description="Seed used for the simulation.", default=None
     )
+    saup_metrics: Optional[dict] = Field(
+        description="SAUP-D aggregation metrics (trajectory-level uncertainty score)",
+        default=None
+    )
 
 
 class Results(BaseModel):

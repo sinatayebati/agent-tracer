@@ -234,10 +234,12 @@ def generate(
     if model.startswith("claude") and not ALLOW_SONNET_THINKING:
         kwargs["thinking"] = {"type": "disabled"}
     
-    # Enable logprobs collection - request top logprobs for tokens
-    # For Vertex AI/Gemini, this will be handled by litellm's model-specific logic
+    # Only enable logprobs if explicitly requested
+    # Vertex AI/Gemini models sometimes have issues with logprobs requests
+    # which can cause empty responses. Only enable when needed for uncertainty calculation.
+    # If not specified, default to False to avoid potential issues
     if "logprobs" not in kwargs:
-        kwargs["logprobs"] = True
+        kwargs["logprobs"] = False
     
     litellm_messages = to_litellm_messages(messages)
     tools = [tool.openai_schema for tool in tools] if tools else None
@@ -279,6 +281,17 @@ def generate(
         for tool_call in tool_calls
     ]
     tool_calls = tool_calls or None
+
+    # Validate that we have either content or tool_calls
+    # Gemini/Vertex AI sometimes returns empty responses
+    if not content and not tool_calls:
+        error_msg = (
+            f"LLM returned empty response (no content and no tool_calls). "
+            f"Model: {model}, finish_reason: {finish_reason}. "
+            f"This is typically a transient API issue. Try again or reduce max-steps."
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
 
     message = AssistantMessage(
         role="assistant",
