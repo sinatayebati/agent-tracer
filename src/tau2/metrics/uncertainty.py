@@ -577,7 +577,7 @@ def calculate_situational_weight(
     do_user_val = do_user if do_user is not None else 0.0
     
     # Linear combination
-    weight = (
+    weight = 1.0 + (
         config.alpha * da_val +
         config.beta * do_agent_val +
         config.gamma * do_user_val

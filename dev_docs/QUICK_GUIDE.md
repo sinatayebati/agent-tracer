@@ -68,7 +68,7 @@ python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-
 
 # Custom SAUP-D configuration (adjust α, β, γ weights)
 python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
-  --saup-config '{"alpha": 2.0, "beta": 1.0, "gamma": 0.5}'
+  --saup-config '{"alpha": 5.0, "beta": 5.0, "gamma": 5}'
 
 # Skip AUROC calculation (if ground truth not available)
 python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-auroc
