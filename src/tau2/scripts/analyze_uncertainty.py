@@ -928,7 +928,7 @@ def main():
     parser.add_argument(
         "--saup-config",
         type=json.loads,
-        default='{"alpha": 1.0, "beta": 1.0, "gamma": 1.0}',
+        default='{"alpha": 5.0, "beta": 5.0, "gamma": 5.0}',
         help='SAUP-D weight configuration (JSON format, e.g., \'{"alpha": 1.0, "beta": 1.0, "gamma": 1.0}\')',
     )
     parser.add_argument(
