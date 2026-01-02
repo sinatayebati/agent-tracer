@@ -983,8 +983,8 @@ def main():
     parser.add_argument(
         "--saup-config",
         type=json.loads,
-        default='{"alpha": 5.0, "beta": 5.0, "gamma": 5.0}',
-        help='SAUP-D weight configuration (JSON format, e.g., \'{"alpha": 1.0, "beta": 1.0, "gamma": 1.0}\')',
+        default='{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.2}',
+        help='SAUP-D weight configuration (JSON format, e.g., \'{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.2}\')',
     )
     parser.add_argument(
         "--no-auroc",
