@@ -115,15 +115,27 @@ class ParticipantMessageBase(BaseModel):
         description="The log probabilities from the LLM response.", default=None
     )
     da_score: Optional[float] = Field(
-        description="Inquiry Drift score (semantic distance from initial goal)",
+        description="DEPRECATED: Legacy field for backward compatibility",
         default=None,
     )
     do_score: Optional[float] = Field(
-        description="Inference Gap score (semantic distance between action and observation)",
+        description="DEPRECATED: Legacy field for backward compatibility",
         default=None,
     )
     do_type: Optional[str] = Field(
-        description="Type of inference gap: 'agent_coherence' or 'user_coherence'",
+        description="DEPRECATED: Legacy field for backward compatibility",
+        default=None,
+    )
+    phi_score: Optional[float] = Field(
+        description="Semantic Flux (Φ) - semantic displacement between consecutive turns",
+        default=None,
+    )
+    density_score: Optional[float] = Field(
+        description="State Density (D) - manifold overlap with temporal decay",
+        default=None,
+    )
+    innovation_score: Optional[float] = Field(
+        description="Information Innovation (I) - subspace residual measuring epistemic novelty",
         default=None,
     )
 

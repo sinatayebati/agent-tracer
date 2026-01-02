@@ -1,10 +1,12 @@
 import time
 import uuid
+from collections import deque
 from copy import deepcopy
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Optional
 
+import numpy as np
 from loguru import logger
 
 from tau2.agent.base import BaseAgent, is_valid_agent_history_message
@@ -24,10 +26,9 @@ from tau2.user.user_simulator import DummyUser, UserSimulator, UserState
 from tau2.metrics.uncertainty import (
     EmbeddingService,
     SAUPConfig,
-    calculate_inference_gap,
-    calculate_information_stagnation,
-    calculate_tool_repetition,
-    calculate_saup_from_trajectory,
+    calculate_semantic_flux,
+    calculate_state_density,
+    calculate_flux_from_trajectory,
     get_uncertainty_stats,
 )
 from tau2.utils.llm_utils import get_cost
@@ -89,28 +90,18 @@ class Orchestrator:
         # SAUP configuration
         self.saup_config = saup_config if saup_config is not None else SAUPConfig()
         
-        # VAUP (Velocity-Aware Uncertainty Propagation) state tracking
+        # SAUP-Flux v4: Universal epistemic change detection
         self.calculate_situational_awareness = calculate_uncertainty
-        self.conversation_history: list[str] = []
-        self.agent_history: list[str] = []  # Track agent text responses for stagnation detection
-        self.agent_tool_history: list[list] = []  # Track agent tool calls for duplicate detection
-        self.global_token_set: set[str] = set()  # Track all unique content tokens (for novelty gate)
-        self.last_do_score: Optional[float] = None  # Track previous inference gap (for momentum)
-        self.initial_instruction: Optional[str] = None
-        self.last_agent_message: Optional[str] = None
+        
+        # Track embeddings for flux calculation
+        self.all_turn_embeddings: list[np.ndarray] = []  # All embeddings in order
+        self.all_turn_indices: list[int] = []  # Turn indices for each embedding
+        self.last_embedding: Optional[np.ndarray] = None  # Previous turn embedding for flux
         
         # Initialize embedding service if enabled
         if self.calculate_situational_awareness:
             self.embedding_service = EmbeddingService()
-            # Extract initial user instruction from task
-            if task.user_scenario and hasattr(task.user_scenario, 'instructions'):
-                instructions = task.user_scenario.instructions
-                if isinstance(instructions, dict):
-                    # Convert dict to string representation
-                    self.initial_instruction = str(instructions)
-                else:
-                    self.initial_instruction = str(instructions)
-            logger.debug(f"Situational awareness enabled. Initial instruction: {self.initial_instruction[:100] if self.initial_instruction else 'None'}...")
+            logger.debug("SAUP-Flux v4 enabled: Universal Innovation Detection via Subspace Residuals")
         else:
             self.embedding_service = None
 
@@ -307,19 +298,20 @@ class Orchestrator:
         else:
             agent_cost, user_cost = res
         
-        # Calculate SAUP-D aggregation score if uncertainty is enabled
+        # Calculate SAUP-Flux aggregation score if uncertainty is enabled
         saup_metrics = None
         if self.calculate_uncertainty:
             try:
-                saup_result = calculate_saup_from_trajectory(messages, self.saup_config)
-                # Remove penalties list from output (too verbose for JSON)
-                saup_metrics = {k: v for k, v in saup_result.items() if k != 'penalties'}
+                flux_result = calculate_flux_from_trajectory(messages, self.saup_config)
+                # Remove verbose lists from output
+                saup_metrics = {k: v for k, v in flux_result.items() if k not in ['wastes', 'groundings', 'weights']}
                 logger.info(
-                    f"SAUP-D Score: {saup_metrics['saup_score']:.4f} "
-                    f"(N={saup_metrics['num_steps']}, mean_penalty={saup_metrics['mean_penalty']:.4f})"
+                    f"FLUX Score: {saup_metrics['flux_score']:.4f} "
+                    f"(N={saup_metrics['num_steps']}, mean_grounding={saup_metrics['mean_grounding']:.4f}, "
+                    f"mean_waste={saup_metrics['mean_waste']:.4f})"
                 )
             except Exception as e:
-                logger.warning(f"Failed to calculate SAUP score: {e}")
+                logger.warning(f"Failed to calculate FLUX score: {e}")
                 saup_metrics = None
         
         simulation_run = SimulationRun(
@@ -338,17 +330,17 @@ class Orchestrator:
         )
         return simulation_run
 
-    def _format_message_for_history(self, message: Message) -> str:
+    def _format_message_for_embedding(self, message: Message) -> str:
         """
-        Format a message for inclusion in conversation history.
+        Format a message for embedding generation.
         
-        Converts messages to readable string format for semantic distance calculation.
+        Converts messages to readable string format including content and tool calls/results.
         
         Args:
             message: Message to format
             
         Returns:
-            str: Formatted message string
+            str: Formatted message string for embedding
         """
         if isinstance(message, (AssistantMessage, UserMessage)):
             parts = []
@@ -373,53 +365,17 @@ class Orchestrator:
         
         return ""
     
-    def _extract_content_tokens(self, text: str) -> set[str]:
-        """
-        Extract content-bearing tokens from text for novelty tracking.
-        
-        Filters out stop words, punctuation, and numeric tokens to focus on
-        high-value entities (names, IDs, actions, domain-specific terms).
-        
-        Args:
-            text: Text to extract tokens from
-            
-        Returns:
-            set[str]: Set of cleaned content tokens
-        """
-        from tau2.metrics.uncertainty import STOP_WORDS
-        
-        if not text or not text.strip():
-            return set()
-        
-        tokens_raw = text.lower().split()
-        tokens = set()
-        
-        def clean_token(token: str) -> str:
-            """Remove leading/trailing punctuation from token."""
-            return token.strip('.,!?;:()[]{}"\'-')
-        
-        for token in tokens_raw:
-            cleaned = clean_token(token)
-            # Skip if empty, stop word, or purely numeric
-            if not cleaned or cleaned in STOP_WORDS:
-                continue
-            if cleaned.replace('.', '').replace('-', '').isdigit():
-                continue
-            tokens.add(cleaned)
-        
-        return tokens
-    
     def _calculate_and_attach_metrics(
         self, message: Message
     ) -> None:
         """
-        Calculate and attach uncertainty and semantic distance metrics to a message.
+        Calculate and attach uncertainty and flux metrics to a message.
         
         Calculates:
         - Uncertainty statistics (U_i): normalized entropy from logprobs
-        - Information Stagnation (Da): novelty-gated stagnation score for agent messages
-        - Tool Repetition: exact duplicate tool call detection
-        - Inference Gap (Do): semantic distance between action and observation
+        - Semantic Flux (Φ_i): displacement from previous turn
+        - State Density (D_i): manifold overlap with history
+        - Innovation (I_i): universal epistemic change via subspace residuals
         
         Args:
             message: The message to calculate metrics for
@@ -442,52 +398,72 @@ class Orchestrator:
                 f"(tokens={uncertainty_stats.token_count})"
             )
         
-        # Calculate semantic distance metrics if situational awareness enabled
-        if self.calculate_situational_awareness and self.embedding_service:
-            # Calculate Da (Information Stagnation) for AGENT messages only
-            # Uses novelty gate to distinguish enumeration from true looping
-            if isinstance(message, AssistantMessage):
-                try:
-                    # Get current message content
-                    current_text = self._format_message_for_history(message)
+        # Calculate semantic flux, density, and innovation if embeddings enabled
+        if self.calculate_situational_awareness and self.embedding_service and self.embedding_service.is_available():
+            try:
+                # Get current message text
+                current_text = self._format_message_for_embedding(message)
+                
+                if current_text:
+                    # Generate embedding for current turn
+                    current_embedding = self.embedding_service.get_embedding(current_text)
                     
-                    # Calculate text-based information stagnation
-                    text_stagnation = 0.0
-                    if current_text:
-                        text_stagnation = calculate_information_stagnation(
-                            current_text,
-                            self.global_token_set,
-                            self.agent_history
-                        )
-                        # Update agent history for next iteration
-                        self.agent_history.append(current_text)
+                    if current_embedding is not None:
+                        current_turn_idx = len(self.all_turn_embeddings)
                         
-                        # Update global token set with new tokens from this message
-                        new_tokens = self._extract_content_tokens(current_text)
-                        self.global_token_set.update(new_tokens)
-                    
-                    # Calculate tool-based repetition
-                    tool_repetition = 0.0
-                    if message.tool_calls:
-                        tool_repetition = calculate_tool_repetition(
-                            message.tool_calls,
-                            self.agent_tool_history
+                        # Calculate Semantic Flux (Φ_i) if we have a previous embedding
+                        phi_score = 0.0
+                        if self.last_embedding is not None:
+                            from tau2.metrics.uncertainty import calculate_semantic_flux
+                            phi_score = calculate_semantic_flux(current_embedding, self.last_embedding)
+                            logger.debug(f"Calculated Φ_i (semantic flux): {phi_score:.4f}")
+                        
+                        # Calculate State Density (D_i) using all history
+                        density_score = 0.0
+                        if self.all_turn_embeddings:
+                            from tau2.metrics.uncertainty import calculate_state_density
+                            density_score = calculate_state_density(
+                                current_embedding,
+                                self.all_turn_embeddings,
+                                current_turn_idx,
+                                self.all_turn_indices,
+                                self.saup_config.decay_lambda
+                            )
+                            logger.debug(f"Calculated D_i (state density): {density_score:.4f}")
+                        
+                        # Calculate Innovation (I_i) - Universal epistemic change detector
+                        innovation_score = 0.0
+                        if self.all_turn_embeddings:
+                            from tau2.metrics.uncertainty import calculate_innovation_score
+                            innovation_score = calculate_innovation_score(
+                                current_embedding,
+                                self.all_turn_embeddings,
+                                window_size=5
+                            )
+                            logger.debug(f"Calculated I_i (innovation): {innovation_score:.4f}")
+                        else:
+                            # First turn is always novel
+                            innovation_score = 1.0
+                        
+                        # Attach metrics to message
+                        message.phi_score = phi_score
+                        message.density_score = density_score
+                        message.innovation_score = innovation_score
+                        
+                        # Update history
+                        self.all_turn_embeddings.append(current_embedding)
+                        self.all_turn_indices.append(current_turn_idx)
+                        self.last_embedding = current_embedding
+                        
+                        logger.debug(
+                            f"Turn {current_turn_idx}: U_i={message.uncertainty.get('normalized_entropy', 0.0):.4f}, "
+                            f"Φ_i={phi_score:.4f}, D_i={density_score:.4f}, I_i={innovation_score:.4f}"
                         )
-                        # Update tool history
-                        self.agent_tool_history.append(message.tool_calls)
-                    
-                    # Aggregate: max (worst-case penalty)
-                    # Either text stagnation OR tool duplication is a failure signal
-                    da_score = max(text_stagnation, tool_repetition)
-                    message.da_score = da_score
-                    
-                    logger.debug(
-                        f"Calculated Da for agent: text_stag={text_stagnation:.4f}, "
-                        f"tool_rep={tool_repetition:.4f}, final={da_score:.4f}"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to calculate stagnation score: {e}")
-                    message.da_score = None
+            except Exception as e:
+                logger.warning(f"Failed to calculate flux metrics: {e}")
+                message.phi_score = None
+                message.density_score = None
+                message.innovation_score = None
 
     def step(self):
         """
@@ -511,58 +487,8 @@ class Orchestrator:
             )
             user_msg.validate()
             
-            # Add to conversation history
-            if self.calculate_situational_awareness:
-                msg_text = self._format_message_for_history(user_msg)
-                if msg_text:
-                    self.conversation_history.append(msg_text)
-                    # Update global token set with user message tokens
-                    user_tokens = self._extract_content_tokens(msg_text)
-                    self.global_token_set.update(user_tokens)
-            
-            # Calculate metrics (uncertainty + semantic distance)
+            # Calculate metrics (uncertainty + flux + density)
             self._calculate_and_attach_metrics(user_msg)
-            
-            # Calculate Do (Inference Gap) for User Coherence
-            # Antecedent = agent's last message, Consequent = user's response
-            if self.calculate_situational_awareness and self.last_agent_message:
-                try:
-                    user_response = self._format_message_for_history(user_msg)
-                    if user_response:
-                        do_score_raw = calculate_inference_gap(
-                            self.last_agent_message,
-                            user_response
-                        )
-                        
-                        # COHERENCE MOMENTUM: Adjust Do based on velocity
-                        do_score_adjusted = do_score_raw
-                        
-                        if self.last_do_score is not None:
-                            velocity = do_score_raw - self.last_do_score
-                            
-                            if velocity < 0:
-                                # Gap is decreasing → Coherence improving → Reward
-                                do_score_adjusted = do_score_raw * 0.5
-                                logger.debug(
-                                    f"User coherence momentum: IMPROVING (Δ={velocity:.4f}), "
-                                    f"raw={do_score_raw:.4f} → adjusted={do_score_adjusted:.4f}"
-                                )
-                            elif velocity > 0:
-                                # Gap is increasing → Coherence degrading → Penalize
-                                do_score_adjusted = do_score_raw * 1.5
-                                logger.debug(
-                                    f"User coherence momentum: DEGRADING (Δ={velocity:.4f}), "
-                                    f"raw={do_score_raw:.4f} → adjusted={do_score_adjusted:.4f}"
-                                )
-                        
-                        # Update last Do score (use raw value for next velocity calculation)
-                        self.last_do_score = do_score_raw
-                        
-                        user_msg.do_score = do_score_adjusted
-                        user_msg.do_type = "user_coherence"
-                        logger.debug(f"Calculated Do (user coherence): {do_score_adjusted:.4f}")
-                except Exception as e:
-                    logger.warning(f"Failed to calculate Do for user: {e}")
             
             if UserSimulator.is_stop(user_msg):
                 self.done = True
@@ -583,16 +509,7 @@ class Orchestrator:
             )
             agent_msg.validate()
             
-            # Add to conversation history
-            if self.calculate_situational_awareness:
-                msg_text = self._format_message_for_history(agent_msg)
-                if msg_text:
-                    self.conversation_history.append(msg_text)
-                    # Store last agent message for user coherence calculation
-                    self.last_agent_message = msg_text
-                    # Note: Agent message tokens are already added in _calculate_and_attach_metrics
-            
-            # Calculate metrics (uncertainty + semantic distance)
+            # Calculate metrics (uncertainty + flux + density)
             self._calculate_and_attach_metrics(agent_msg)
             
             if self.agent.is_stop(agent_msg):
@@ -610,10 +527,6 @@ class Orchestrator:
             if not self.message.is_tool_call():
                 raise ValueError("Agent or User should send tool call to environment")
             
-            # Store the tool call message for Do calculation
-            tool_call_msg = self.message
-            tool_call_text = self._format_message_for_history(tool_call_msg) if self.calculate_situational_awareness else None
-            
             tool_msgs = []
             for tool_call in self.message.tool_calls:
                 tool_msg = self.environment.get_response(tool_call)
@@ -622,66 +535,23 @@ class Orchestrator:
                 "Number of tool calls and tool messages should be the same"
             )
             
-            # Calculate Do (Inference Gap) for Agent/User Tool Coherence
-            if self.calculate_situational_awareness and tool_call_text:
+            # Process tool response embeddings for flux calculation
+            # Tool responses contribute to the semantic trajectory
+            if self.calculate_situational_awareness and self.embedding_service:
                 try:
-                    # Concatenate all tool observations
-                    tool_observations = []
+                    # Format and embed tool observations
                     for tool_msg in tool_msgs:
-                        obs = self._format_message_for_history(tool_msg)
-                        if obs:
-                            tool_observations.append(obs)
-                            # Update global token set with observation tokens
-                            obs_tokens = self._extract_content_tokens(obs)
-                            self.global_token_set.update(obs_tokens)
-                    
-                    if tool_observations:
-                        combined_observation = " | ".join(tool_observations)
-                        do_score_raw = calculate_inference_gap(
-                            tool_call_text,
-                            combined_observation
-                        )
-                        
-                        # COHERENCE MOMENTUM: Adjust Do based on velocity
-                        # If coherence is improving (gap decreasing), reward with 0.5x multiplier
-                        # If coherence is degrading (gap increasing), penalize with 1.5x multiplier
-                        do_score_adjusted = do_score_raw
-                        
-                        if self.last_do_score is not None:
-                            velocity = do_score_raw - self.last_do_score
-                            
-                            if velocity < 0:
-                                # Gap is decreasing → Agent is "zeroing in" → Reward
-                                do_score_adjusted = do_score_raw * 0.5
-                                logger.debug(
-                                    f"Coherence momentum: IMPROVING (Δ={velocity:.4f}), "
-                                    f"raw={do_score_raw:.4f} → adjusted={do_score_adjusted:.4f}"
-                                )
-                            elif velocity > 0:
-                                # Gap is increasing → Agent is drifting → Penalize
-                                do_score_adjusted = do_score_raw * 1.5
-                                logger.debug(
-                                    f"Coherence momentum: DEGRADING (Δ={velocity:.4f}), "
-                                    f"raw={do_score_raw:.4f} → adjusted={do_score_adjusted:.4f}"
-                                )
-                        
-                        # Update last Do score (use raw value for next velocity calculation)
-                        self.last_do_score = do_score_raw
-                        
-                        # Attach adjusted Do score to the requesting message (agent or user)
-                        if self.from_role == Role.AGENT:
-                            tool_call_msg.do_score = do_score_adjusted
-                            tool_call_msg.do_type = "agent_coherence"
-                            logger.debug(f"Calculated Do (agent coherence): {do_score_adjusted:.4f}")
-                        elif self.from_role == Role.USER:
-                            tool_call_msg.do_score = do_score_adjusted
-                            tool_call_msg.do_type = "user_coherence"
-                            logger.debug(f"Calculated Do (user tool coherence): {do_score_adjusted:.4f}")
-                        
-                        # Add tool observation to history
-                        self.conversation_history.append(combined_observation)
+                        obs_text = self._format_message_for_embedding(tool_msg)
+                        if obs_text:
+                            obs_embedding = self.embedding_service.get_embedding(obs_text)
+                            if obs_embedding is not None:
+                                turn_idx = len(self.all_turn_embeddings)
+                                self.all_turn_embeddings.append(obs_embedding)
+                                self.all_turn_indices.append(turn_idx)
+                                self.last_embedding = obs_embedding
+                                logger.debug(f"Added tool observation embedding (turn {turn_idx})")
                 except Exception as e:
-                    logger.warning(f"Failed to calculate Do for tool call: {e}")
+                    logger.warning(f"Failed to process tool observation embeddings: {e}")
             
             self.trajectory.extend(tool_msgs)
             if (

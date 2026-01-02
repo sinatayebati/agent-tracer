@@ -478,42 +478,313 @@ def calculate_semantic_distance(text_a: str, text_b: str) -> float:
         return 0.0
 
 
+def calculate_semantic_flux(
+    current_embedding: np.ndarray,
+    previous_embedding: np.ndarray
+) -> float:
+    """
+    Calculate Semantic Flux (Φ) - the semantic displacement between consecutive turns.
+    
+    Measures how much "ground" the agent is covering semantically. High flux indicates
+    progress and exploration; low flux indicates stagnation.
+    
+    Formula:
+        Φ_i = ||E_i - E_{i-1}||_2 (Euclidean distance between embeddings)
+    
+    Args:
+        current_embedding: Embedding vector for current turn
+        previous_embedding: Embedding vector for previous turn
+        
+    Returns:
+        float: Semantic flux (Euclidean distance), >= 0
+               Returns 0.0 if embeddings are invalid
+    
+    Example:
+        >>> # High flux - agent making progress
+        >>> flux = calculate_semantic_flux(emb_new_state, emb_old_state)
+        >>> # flux ≈ 0.8 (significant semantic movement)
+        
+        >>> # Low flux - agent stuck in loop
+        >>> flux = calculate_semantic_flux(emb_repeat, emb_original)
+        >>> # flux ≈ 0.02 (minimal semantic movement)
+    """
+    if current_embedding is None or previous_embedding is None:
+        return 0.0
+    
+    if len(current_embedding) == 0 or len(previous_embedding) == 0:
+        return 0.0
+    
+    try:
+        # Euclidean distance (L2 norm of difference)
+        flux = float(np.linalg.norm(current_embedding - previous_embedding))
+        return max(0.0, flux)
+    except Exception as e:
+        logger.error(f"Error calculating semantic flux: {e}")
+        return 0.0
+
+
+def calculate_grounding_ratio(
+    semantic_flux: float,
+    normalized_entropy: float,
+    epsilon: float = 0.01
+) -> float:
+    """
+    Calculate Grounding Ratio (G) - the core "Signal Separator" for failure detection.
+    
+    This metric identifies the "Confident Refusal Trap" where agents confidently
+    produce responses (low entropy) but make zero semantic progress (low flux).
+    
+    Formula:
+        G_i = Φ_i / (U_i + ε)
+    
+    Interpretation:
+        - High G (>1.0): Efficient movement (low uncertainty, high progress) → SUCCESS
+        - Low G (0.1-1.0): Stagnant confusion (high uncertainty, low progress) → CONFUSION
+        - Near-Zero G (<0.1): Confident refusal/looping (near-zero uncertainty, zero flux) → FAILURE
+    
+    Args:
+        semantic_flux: Semantic displacement (Φ_i) between consecutive turns
+        normalized_entropy: Token-level uncertainty (U_i) of current turn
+        epsilon: Small constant to prevent division by zero (default 0.01)
+                 Small epsilon allows confident failures to drive G → 0
+        
+    Returns:
+        float: Grounding ratio, >= 0
+               Higher values indicate efficient progress
+               Values near 0 indicate confident failure (the trap)
+    
+    Example (Confident Refusal - FAILURE SIGNAL):
+        >>> G = calculate_grounding_ratio(flux=0.02, entropy=0.05, epsilon=0.01)
+        >>> # G ≈ 0.02 / 0.06 ≈ 0.33 (near-zero, confident trap)
+    
+    Example (Successful Search - PROGRESS):
+        >>> G = calculate_grounding_ratio(flux=0.8, entropy=0.15, epsilon=0.01)
+        >>> # G ≈ 0.8 / 0.16 = 5.0 (high efficiency)
+    """
+    # Prevent negative values
+    flux = max(0.0, semantic_flux)
+    entropy = max(0.0, normalized_entropy)
+    
+    # Small epsilon allows near-zero entropy to create near-zero grounding
+    # (the confident refusal trap)
+    denominator = entropy + epsilon
+    
+    grounding = flux / denominator
+    
+    return float(grounding)
+
+
+def calculate_innovation_score(
+    current_embedding: np.ndarray,
+    history_embeddings: list[np.ndarray],
+    window_size: int = 5
+) -> float:
+    """
+    Calculate Information Innovation (I) - universal epistemic change detector.
+    
+    Uses subspace residual analysis to detect when the agent is introducing
+    new information, regardless of domain. This replaces domain-specific
+    regex patterns with a universal geometric method.
+    
+    **The Core Insight:**
+    When an agent just repeats templates, the current embedding lies almost
+    entirely within the subspace spanned by recent turns (high cosine similarity).
+    When an agent introduces NEW information (new flight IDs, novel observations),
+    the embedding moves into a NEW dimension (low similarity to all past turns).
+    
+    **Algorithm (Cosine Max-Pooling for Numerical Stability):**
+    1. Take the last `window_size` turns (default 5) as context
+    2. Calculate cosine similarity between current and each context turn
+    3. Innovation = 1 - max(similarities)
+       - If max_similarity ≈ 1.0 → Innovation ≈ 0 (pure repetition)
+       - If max_similarity < 0.7 → Innovation > 0.3 (new information)
+    
+    Formula:
+        I_i = 1 - max_j { cos_sim(E_i, E_j) } for j in last K turns
+    
+    Args:
+        current_embedding: Embedding for current turn
+        history_embeddings: List of embeddings from previous turns
+        window_size: Number of recent turns to use as context (default 5)
+        
+    Returns:
+        float: Innovation score in range [0, 1] where:
+               - 0.0 = pure repetition (embedding in subspace)
+               - ~0.3 = moderate novelty
+               - ~0.7+ = high innovation (new dimension)
+               Returns 1.0 if history is empty (first turn is always novel)
+    
+    Example (Repetition - Low Innovation):
+        >>> # Agent repeats "I'm sorry, I can't help"
+        >>> current = embed("I apologize, I cannot assist")
+        >>> history = [embed("I'm sorry, I can't help"), embed("I apologize...")]
+        >>> innovation = calculate_innovation_score(current, history)
+        >>> # Returns ≈ 0.05 (max_similarity ≈ 0.95)
+    
+    Example (New Information - High Innovation):
+        >>> # Agent discovers new flight ID
+        >>> current = embed("Found flight AA123 at 3pm")
+        >>> history = [embed("Searching..."), embed("Found flight BB456...")]
+        >>> innovation = calculate_innovation_score(current, history)
+        >>> # Returns ≈ 0.6 (max_similarity ≈ 0.4, different entities)
+    """
+    # Edge case: Empty history (first turn is always novel)
+    if not history_embeddings or current_embedding is None:
+        return 1.0
+    
+    if len(current_embedding) == 0:
+        return 1.0
+    
+    try:
+        # Take last K turns as context subspace
+        context_window = history_embeddings[-window_size:] if len(history_embeddings) > window_size else history_embeddings
+        
+        if not context_window:
+            return 1.0
+        
+        # Normalize current embedding
+        current_norm = np.linalg.norm(current_embedding)
+        if current_norm == 0:
+            return 0.0
+        current_normalized = current_embedding / current_norm
+        
+        # Calculate cosine similarity with each context turn
+        max_similarity = 0.0
+        for past_emb in context_window:
+            if past_emb is None or len(past_emb) == 0:
+                continue
+            
+            # Normalize past embedding
+            past_norm = np.linalg.norm(past_emb)
+            if past_norm == 0:
+                continue
+            past_normalized = past_emb / past_norm
+            
+            # Cosine similarity = dot product of normalized vectors
+            cosine_sim = float(np.dot(current_normalized, past_normalized))
+            
+            # Clamp to [0, 1] (should already be in [-1, 1], but clamp for safety)
+            cosine_sim = max(0.0, min(1.0, cosine_sim))
+            
+            # Track maximum similarity (closest match in subspace)
+            max_similarity = max(max_similarity, cosine_sim)
+        
+        # Innovation = 1 - max_similarity
+        # High similarity to past → Low innovation (repetition)
+        # Low similarity to past → High innovation (new information)
+        innovation = 1.0 - max_similarity
+        
+        logger.debug(
+            f"Innovation calculation: max_sim={max_similarity:.3f} → "
+            f"innovation={innovation:.3f} (window={len(context_window)} turns)"
+        )
+        
+        return float(innovation)
+    
+    except Exception as e:
+        logger.error(f"Error calculating innovation score: {e}")
+        return 0.0
+
+
+def calculate_state_density(
+    current_embedding: np.ndarray,
+    history_embeddings: list[np.ndarray],
+    current_turn: int,
+    history_turns: list[int],
+    decay_lambda: float = 0.1
+) -> float:
+    """
+    Calculate State Density (D) - measures manifold overlap (revisiting old states).
+    
+    Uses temporal decay so that revisiting a state from 20 turns ago is penalized
+    less than revisiting a state from 2 turns ago.
+    
+    Formula:
+        D_i = max_j { exp(-λ × |i - j|) × (1 - ||E_i - E_j||_2) }
+    
+    Where:
+        - λ (decay_lambda): Controls temporal decay rate (default 0.1)
+        - Exponential decay favors recent history
+        - (1 - distance) converts distance to similarity (high when states overlap)
+    
+    Args:
+        current_embedding: Embedding for current turn
+        history_embeddings: List of embeddings from previous turns
+        current_turn: Turn index of current state
+        history_turns: List of turn indices for history embeddings
+        decay_lambda: Temporal decay parameter (default 0.1)
+        
+    Returns:
+        float: State density in range [0, 1] where:
+               - 0.0 = completely novel state (no overlap)
+               - ~0.5 = moderate overlap with decayed history
+               - 1.0 = exact repetition of recent state (failure signal)
+    
+    Example (Novel State - Good):
+        >>> density = calculate_state_density(emb_new, [emb1, emb2], 10, [8, 9], 0.1)
+        >>> # density ≈ 0.1 (new semantic territory)
+    
+    Example (Recent Loop - Bad):
+        >>> density = calculate_state_density(emb_repeat, [emb_orig], 5, [3], 0.1)
+        >>> # density ≈ 0.9 (revisiting recent state with high similarity)
+    """
+    if current_embedding is None or not history_embeddings:
+        return 0.0
+    
+    if len(current_embedding) == 0:
+        return 0.0
+    
+    if len(history_embeddings) != len(history_turns):
+        logger.warning(
+            f"Mismatch in history lengths: {len(history_embeddings)} embeddings, "
+            f"{len(history_turns)} turns"
+        )
+        return 0.0
+    
+    max_density = 0.0
+    
+    try:
+        for past_emb, past_turn in zip(history_embeddings, history_turns):
+            if past_emb is None or len(past_emb) == 0:
+                continue
+            
+            # Temporal decay: exp(-λ × |i - j|)
+            time_diff = abs(current_turn - past_turn)
+            temporal_weight = np.exp(-decay_lambda * time_diff)
+            
+            # Semantic similarity: 1 - distance
+            # Distance is normalized by embedding dimension for stability
+            distance = float(np.linalg.norm(current_embedding - past_emb))
+            similarity = 1.0 - min(distance, 1.0)  # Clamp distance to [0, 1]
+            
+            # Weighted density
+            density = temporal_weight * similarity
+            
+            # Track maximum (worst-case overlap)
+            max_density = max(max_density, density)
+        
+        return float(max_density)
+    except Exception as e:
+        logger.error(f"Error calculating state density: {e}")
+        return 0.0
+
+
 def calculate_jaccard_similarity(text_a: str, text_b: str) -> float:
     """
     Calculate Jaccard similarity between two texts (lexical overlap).
     
-    Measures the intersection-over-union of content tokens, filtering out
-    stop words and punctuation. This captures whether the specific entities
-    and actions are identical, not just the semantic intent.
+    DEPRECATED: This function is kept for backward compatibility but is not
+    used in the SAUP-Flux framework.
     
-    Formula:
-        Jaccard = |tokens_a ∩ tokens_b| / |tokens_a ∪ tokens_b|
+    Measures the intersection-over-union of content tokens, filtering out
+    stop words and punctuation.
     
     Args:
         text_a: First text string
         text_b: Second text string
         
     Returns:
-        float: Jaccard similarity in range [0, 1] where:
-               - 0.0 = no token overlap
-               - 0.5 = moderate overlap
-               - 1.0 = identical token sets
-               Returns 0.0 if either text is empty or all tokens filtered
-    
-    Example:
-        >>> # Looping case
-        >>> jaccard = calculate_jaccard_similarity(
-        ...     "I can help with that",
-        ...     "I can help with that"
-        ... )
-        >>> # Returns ~1.0 (identical tokens)
-        
-        >>> # Enumeration case
-        >>> jaccard = calculate_jaccard_similarity(
-        ...     "Flight A123 is cancelled",
-        ...     "Flight B456 is cancelled"
-        ... )
-        >>> # Returns ~0.33 (only "Flight" and "cancelled" overlap)
+        float: Jaccard similarity in range [0, 1]
     """
     # Handle edge cases
     if not text_a or not text_b:
@@ -573,143 +844,16 @@ def calculate_information_stagnation(
     history_texts: list[str]
 ) -> float:
     """
+    DEPRECATED: This function is replaced by State Density in the SAUP-Flux framework.
+    Kept for backward compatibility only.
+    
     Calculate Information Stagnation score - measures lack of information gain velocity.
     
-    This metric implements a **Novelty Gate** that distinguishes template reuse from
-    true stagnation. The agent is NOT penalized for using standard phrasing if it
-    introduces new high-value entities (flights, IDs, names, etc.).
-    
-    Formula:
-        1. Calculate Novelty Ratio: R_novel = |NewTokens| / |AllCurrentTokens|
-        2. Hard Gate: If R_novel > 0.15, return 0.0 (Progress detected)
-        3. Soft Penalty: If R_novel <= 0.15, calculate:
-           stagnation = max(CosineSim_i × (1 - R_novel)) for recent history
-    
-    The gate ensures that enumeration (same template, different entities) scores
-    near-zero stagnation, while true looping (same template, same entities) scores high.
-    
-    Args:
-        current_text: Current agent response text
-        global_token_set: Set of all unique content tokens seen in the trajectory so far
-        history_texts: List of previous agent response texts (for semantic similarity)
-                       
     Returns:
-        float: Information stagnation score in range [0, 1] where:
-               - 0.0 = novel information introduced (R_novel > 15%)
-               - ~0.5 = moderate stagnation (some novelty, high semantic similarity)
-               - >0.8 = true stagnation (no new info, repetitive intent)
-               Returns 0.0 if history is empty or embeddings unavailable
-    
-    Example (Enumeration - Low Penalty):
-        >>> global_set = {"flight", "cancelled", "a123", "b456"}
-        >>> history = ["Flight A123 cancelled", "Flight B456 cancelled"]
-        >>> current = "Flight C789 cancelled"  # New entity: C789
-        >>> score = calculate_information_stagnation(current, global_set, history)
-        >>> # Returns ~0.0 (R_novel = 1/3 = 33% > 15%)
-    
-    Example (Looping - High Penalty):
-        >>> global_set = {"help", "assist", "today"}
-        >>> history = ["I can help with that", "Let me assist you"]
-        >>> current = "I can help with that"  # Exact repeat, no new tokens
-        >>> score = calculate_information_stagnation(current, global_set, history)
-        >>> # Returns ~0.95 (R_novel = 0%, high cosine similarity)
+        float: Always returns 0.0 (deprecated)
     """
-    # Handle edge cases
-    if not current_text or not current_text.strip():
-        return 0.0
-    
-    if not history_texts:
-        return 0.0
-    
-    # Extract and filter current tokens
-    current_tokens_raw = current_text.lower().split()
-    current_tokens = set()
-    
-    def clean_token(token: str) -> str:
-        """Remove leading/trailing punctuation from token."""
-        return token.strip('.,!?;:()[]{}"\'-')
-    
-    for token in current_tokens_raw:
-        cleaned = clean_token(token)
-        # Skip if empty, stop word, or purely numeric
-        if not cleaned or cleaned in STOP_WORDS:
-            continue
-        if cleaned.replace('.', '').replace('-', '').isdigit():
-            continue
-        current_tokens.add(cleaned)
-    
-    # Handle case where all tokens were filtered
-    if not current_tokens:
-        return 0.0
-    
-    # Calculate Novelty Ratio: fraction of tokens that are NEW to the global set
-    new_tokens = current_tokens - global_token_set
-    R_novel = len(new_tokens) / len(current_tokens)
-    
-    logger.debug(
-        f"Novelty check: {len(new_tokens)}/{len(current_tokens)} new tokens "
-        f"(R_novel={R_novel:.3f})"
-    )
-    
-    # THE HARD GATE: If novelty exceeds 15%, this is progress (enumeration)
-    if R_novel > 0.15:
-        logger.debug(f"Novelty gate triggered (R_novel={R_novel:.3f} > 0.15). No penalty.")
-        return 0.0
-    
-    # THE SOFT PENALTY: Low novelty detected, check semantic similarity
-    # Get embedding service for semantic similarity
-    service = EmbeddingService()
-    if not service.is_available():
-        logger.debug("Embedding service not available, using novelty-only penalty")
-        # Fallback: pure novelty-based penalty
-        return float(1.0 - R_novel)
-    
-    # Get embedding for current text
-    current_embedding = service.get_embedding(current_text)
-    if current_embedding is None:
-        return float(1.0 - R_novel)
-    
-    # Look at last 3 turns (local window for stagnation detection)
-    recent_history = history_texts[-3:] if len(history_texts) > 3 else history_texts
-    
-    max_stagnation_score = 0.0
-    
-    for past_text in recent_history:
-        if not past_text or not past_text.strip():
-            continue
-        
-        # Calculate semantic similarity (cosine)
-        past_embedding = service.get_embedding(past_text)
-        if past_embedding is None:
-            continue
-        
-        try:
-            norm_current = np.linalg.norm(current_embedding)
-            norm_past = np.linalg.norm(past_embedding)
-            
-            if norm_current == 0 or norm_past == 0:
-                continue
-            
-            # Cosine similarity
-            cosine_sim = np.dot(current_embedding, past_embedding) / (norm_current * norm_past)
-            cosine_sim = max(0.0, min(1.0, float(cosine_sim)))
-            
-            # Stagnation formula: Semantic similarity × (lack of novelty)
-            # This penalizes "same intent + no new info"
-            stagnation = cosine_sim * (1.0 - R_novel)
-            
-            # Track maximum (worst-case stagnation)
-            max_stagnation_score = max(max_stagnation_score, stagnation)
-            
-            logger.debug(
-                f"Stagnation check: cosine={cosine_sim:.3f}, R_novel={R_novel:.3f}, "
-                f"stagnation={stagnation:.3f}"
-            )
-        except Exception as e:
-            logger.error(f"Error calculating information stagnation: {e}")
-            continue
-    
-    return max_stagnation_score
+    logger.warning("calculate_information_stagnation is deprecated. Use calculate_state_density instead.")
+    return 0.0
 
 
 def calculate_tool_repetition(
@@ -717,106 +861,15 @@ def calculate_tool_repetition(
     tool_call_history: list[list]
 ) -> float:
     """
+    DEPRECATED: This function is not used in the SAUP-Flux framework.
+    Kept for backward compatibility only.
+    
     Calculate Tool Repetition penalty for exact duplicate tool calls.
     
-    Exact duplicate tool calls (same name + same arguments) are always logical
-    failures - the agent is stuck retrying the same failed operation.
-    
-    Formula:
-        ToolRepetition = 1.0 if exact duplicate found in recent history, else 0.0
-    
-    Args:
-        current_tool_calls: List of current tool call objects/dicts with
-                           'name' and 'arguments' fields
-        tool_call_history: List of past tool call lists (from last 5 turns)
-                          Each element is a list of tool calls from one turn
-                       
     Returns:
-        float: Tool repetition score:
-               - 1.0 = exact duplicate found (failure signal)
-               - 0.0 = no duplicates (valid)
-    
-    Example (Duplicate - High Penalty):
-        >>> current = [{'name': 'get_flight', 'arguments': {'id': 'A123'}}]
-        >>> history = [
-        ...     [{'name': 'get_flight', 'arguments': {'id': 'A123'}}],
-        ...     [{'name': 'cancel_flight', 'arguments': {'id': 'B456'}}]
-        ... ]
-        >>> score = calculate_tool_repetition(current, history)
-        >>> # Returns 1.0 (exact duplicate in history)
-    
-    Example (Different Args - No Penalty):
-        >>> current = [{'name': 'get_flight', 'arguments': {'id': 'B456'}}]
-        >>> history = [
-        ...     [{'name': 'get_flight', 'arguments': {'id': 'A123'}}]
-        ... ]
-        >>> score = calculate_tool_repetition(current, history)
-        >>> # Returns 0.0 (different arguments)
+        float: Always returns 0.0 (deprecated)
     """
-    if not current_tool_calls:
-        return 0.0
-    
-    if not tool_call_history:
-        return 0.0
-    
-    # Create signatures for current tool calls
-    def create_tool_signature(tool_call) -> str:
-        """Create a unique signature for a tool call."""
-        try:
-            # Handle both dict and object formats
-            if isinstance(tool_call, dict):
-                name = tool_call.get('name', '')
-                arguments = tool_call.get('arguments', {})
-            else:
-                name = getattr(tool_call, 'name', '')
-                arguments = getattr(tool_call, 'arguments', {})
-            
-            # Sort arguments for consistent hashing
-            if isinstance(arguments, dict):
-                sorted_args = sorted(arguments.items())
-            elif isinstance(arguments, str):
-                # Arguments might be JSON string
-                try:
-                    import json
-                    args_dict = json.loads(arguments)
-                    sorted_args = sorted(args_dict.items())
-                except:
-                    sorted_args = [(arguments,)]
-            else:
-                sorted_args = [(str(arguments),)]
-            
-            # Create signature: name + sorted arguments
-            signature = f"{name}:{sorted_args}"
-            return signature
-        except Exception as e:
-            logger.debug(f"Error creating tool signature: {e}")
-            return ""
-    
-    # Get signatures for current tool calls
-    current_signatures = set()
-    for tool_call in current_tool_calls:
-        sig = create_tool_signature(tool_call)
-        if sig:
-            current_signatures.add(sig)
-    
-    if not current_signatures:
-        return 0.0
-    
-    # Check against recent history (last 5 turns)
-    recent_history = tool_call_history[-5:] if len(tool_call_history) > 5 else tool_call_history
-    
-    for past_tool_calls in recent_history:
-        if not past_tool_calls:
-            continue
-        
-        # Get signatures for this historical turn
-        for past_tool_call in past_tool_calls:
-            past_sig = create_tool_signature(past_tool_call)
-            if past_sig and past_sig in current_signatures:
-                # Found exact duplicate!
-                logger.debug(f"Tool repetition detected: {past_sig}")
-                return 1.0
-    
+    logger.warning("calculate_tool_repetition is deprecated and not used in FLUX framework.")
     return 0.0
 
 
@@ -825,87 +878,30 @@ def calculate_inquiry_drift(
     history_so_far: list[str]
 ) -> float:
     """
+    DEPRECATED: This function is not used in the SAUP-Flux framework.
+    Kept for backward compatibility only.
+    
     Calculate Inquiry Drift (Da) - semantic distance from initial goal.
     
-    **DEPRECATED:** This metric is flawed for task-oriented dialogue
-    
-    Measures how much the conversation has drifted from the original user
-    instruction/goal. This is computed by comparing the initial instruction
-    with the concatenated conversation history.
-    
-    Formula:
-        Da = SemanticDistance(user_instruction, concatenate(history_so_far))
-    
-    Args:
-        user_instruction: The initial goal/problem description from the task
-        history_so_far: List of all text strings (messages, tool calls,
-                       observations) generated in the conversation up to
-                       the current step
-                       
     Returns:
-        float: Inquiry drift score in range [0, 2] where:
-               - 0.0 = conversation perfectly aligned with goal
-               - ~0.5 = moderate drift
-               - >1.0 = significant drift from original intent
-               Returns 0.0 if calculation fails
-    
-    Example:
-        >>> drift = calculate_inquiry_drift(
-        ...     "I need to change my flight",
-        ...     ["Can you help?", "Looking up flights...", "Found 3 options"]
-        ... )
+        float: Always returns 0.0 (deprecated)
     """
-    if not user_instruction or not history_so_far:
-        return 0.0
-    
-    # Concatenate history into single string
-    # Use newlines to separate turns for better semantic representation
-    concatenated_history = "\n".join(history_so_far)
-    
-    if not concatenated_history.strip():
-        return 0.0
-    
-    # Calculate semantic distance
-    distance = calculate_semantic_distance(user_instruction, concatenated_history)
-    
-    return distance
+    logger.warning("calculate_inquiry_drift is deprecated and not used in FLUX framework.")
+    return 0.0
 
 
 def calculate_inference_gap(antecedent: str, consequent: str) -> float:
     """
+    DEPRECATED: Replaced by calculate_semantic_flux in the SAUP-Flux framework.
+    Kept for backward compatibility only.
+    
     Calculate Inference Gap (Do) - semantic distance between action and observation.
     
-    In the dual-control Tau-2 environment, this metric measures:
-    - Agent Coherence: Distance between agent's tool call and its observation
-    - User Coherence: Distance between agent's message and user's response
-    
-    Formula:
-        Do = SemanticDistance(antecedent, consequent)
-    
-    Args:
-        antecedent: What was intended/asked (agent's action or message)
-        consequent: What actually happened (observation or user's response)
-        
     Returns:
-        float: Inference gap score in range [0, 2] where:
-               - 0.0 = perfect coherence between action and outcome
-               - ~0.5 = moderate gap
-               - >1.0 = significant mismatch
-               Returns 0.0 if calculation fails
-    
-    Example (Agent Coherence):
-        >>> gap = calculate_inference_gap(
-        ...     "Tool: get_customer_info(id='123')",
-        ...     "Customer John Doe, phone: 555-1234"
-        ... )
-        
-    Example (User Coherence):
-        >>> gap = calculate_inference_gap(
-        ...     "Please provide your account number",
-        ...     "My number is ABC-123"
-        ... )
+        float: Always returns 0.0 (deprecated, use semantic_flux instead)
     """
-    return calculate_semantic_distance(antecedent, consequent)
+    logger.warning("calculate_inference_gap is deprecated. Use calculate_semantic_flux instead.")
+    return 0.0
 
 
 # ============================================================================
@@ -916,19 +912,24 @@ def calculate_inference_gap(antecedent: str, consequent: str) -> float:
 @dataclass
 class SAUPConfig:
     """
-    Configuration for SAUP-D aggregation.
+    Configuration for SAUP-Flux aggregation.
     
-    The situational weight for each step is calculated as:
-        W_i = alpha * Da_i + beta * Do_agent_i + gamma * Do_user_i
+    The flux efficiency model measures topological efficiency of trajectories:
+        Waste_i = (1/G_i) × D_i, where G_i = Φ_i / (U_i + ε)
+        FLUX_Score = mean_weight × Mean(w_i × Waste_i) + max_weight × Max(w_i × Waste_i)
     
     Attributes:
-        alpha: Weight for inquiry drift (Da) - default 1.0
-        beta: Weight for agent coherence (Do_agent) - default 1.0
-        gamma: Weight for user coherence (Do_user) - default 1.0
+        epsilon: Small constant for grounding ratio denominator (default 0.01)
+        decay_lambda: Temporal decay for state density (default 0.1)
+        mean_weight: Weight for mean waste in hybrid (default 0.7)
+        max_weight: Weight for max waste in hybrid (default 0.3)
+        flux_saturation: Saturation cap for flux (default 2.0)
     """
-    alpha: float = 1.0
-    beta: float = 1.0
-    gamma: float = 1.0
+    epsilon: float = 0.01
+    decay_lambda: float = 0.1
+    mean_weight: float = 0.7
+    max_weight: float = 0.3
+    flux_saturation: float = 2.0
 
 
 def calculate_situational_weight(
@@ -938,65 +939,244 @@ def calculate_situational_weight(
     config: SAUPConfig
 ) -> float:
     """
-    Calculate situational penalty for a single step (additive component).
+    DEPRECATED: This function is not used in the SAUP-Flux framework.
+    Kept for backward compatibility only.
     
-    The penalty combines semantic distance metrics (Da, Do) to measure
-    how "risky" or "uncertain" the situational context is at step i.
-    This is now used as an additive term rather than a multiplicative weight.
-    
-    Formula:
-        Penalty_i = alpha * Da_i + beta * Do_agent_i + gamma * Do_user_i
-    
-    Args:
-        da: Inquiry drift score (None treated as 0.0)
-        do_agent: Agent coherence score (None treated as 0.0)
-        do_user: User coherence score (None treated as 0.0)
-        config: SAUP configuration with alpha, beta, gamma weights
-        
     Returns:
-        float: Situational penalty >= 0
-    
-    Example:
-        >>> config = SAUPConfig(alpha=1.0, beta=1.0, gamma=1.0)
-        >>> penalty = calculate_situational_weight(0.2, 0.3, None, config)
-        >>> # Returns: 1.0*0.2 + 1.0*0.3 + 1.0*0.0 = 0.5
+        float: Always returns 0.0 (deprecated)
     """
-    # Handle None values (treat as 0.0)
-    da_val = da if da is not None else 0.0
-    do_agent_val = do_agent if do_agent is not None else 0.0
-    do_user_val = do_user if do_user is not None else 0.0
-    
-    # Linear combination (additive penalty)
-    penalty = (
-        config.alpha * da_val +
-        config.beta * do_agent_val +
-        config.gamma * do_user_val
-    )
-    
-    return float(penalty)
+    logger.warning("calculate_situational_weight is deprecated and not used in FLUX framework.")
+    return 0.0
 
 
-def calculate_saup_score(
+def calculate_flux_efficiency(
     step_data: list[dict],
     config: Optional[SAUPConfig] = None
 ) -> dict:
     """
-    Calculate VAUP (Velocity-Aware Uncertainty Propagation) aggregation score.
+    Calculate Gated Flux Efficiency score with Universal Innovation Detection (SAUP v4).
     
-    Implements the VAUP formula with **Logistic Temporal Weighting** to focus
-    analysis on the "Critical Action Phase" (middle 40%-90% of trajectory):
+    The Universal Efficiency Gate protects "Innovative Repetition" (systematic work)
+    from being penalized as waste. Uses subspace residuals to detect epistemic novelty.
     
-        U_trajectory = sqrt( (sum(w_i * (U_i + Penalty_i)^2)) / sum(w_i) )
+    Formula:
+        D'_i = D_i × (1 - I_i)  [Gated Density: Innovation kills density penalty]
+        G_i = Φ_i / (U_i + ε)  [Grounding Ratio: Flux over uncertainty]
+        E_i = min(1.0, G_i / (1 + G_i))  [Robust Efficiency: Bounded sigmoid]
+        Risk_i = max(D'_i - E_i, 0)  [Turn Risk: Gated density minus efficiency]
+        Risk_i = min(Risk_i, 3.0)  [Saturation cap]
+        
+        FLUX = 0.7 × Mean(w_i × Risk_i) + 0.3 × Max(w_i × Risk_i)
     
     Where:
-        - w_i = sigmoid(12 * (t_i - 0.7)) with t_i = i/N (normalized turn index)
-        - U_i = normalized entropy for step i
-        - Penalty_i = α·Da_i + β·Do_agent_i + γ·Do_user_i
+        - Φ_i: Semantic flux (movement)
+        - U_i: Normalized entropy (uncertainty)
+        - D_i: State density (overlap)
+        - I_i: Innovation score (epistemic novelty via subspace residuals)
+        - G_i: Grounding ratio (efficiency of movement)
+        - E_i: Bounded efficiency coefficient (prevents high-entropy bombs)
+        - w_i: Logistic temporal weight (later turns weighted more)
     
-    The logistic weighting creates an S-curve that:
-    - De-emphasizes early turns (setup phase, low risk)
-    - Emphasizes middle turns 40%-90% (critical decision phase)
-    - De-emphasizes late turns (cleanup phase, outcome already determined)
+    **The Innovation Gate:**
+    - If I_i = 1.0 (high innovation), D'_i → 0 (density penalty disappears)
+    - If I_i = 0.0 (pure repetition), D'_i = D_i (full density penalty applies)
+    
+    Success Pattern (Sim #4 - Systematic Search):
+        - High Φ (agent moves), Moderate U (some uncertainty), High I (new entities)
+        - D'_i ≈ 0 (innovation kills density), High E_i (efficient)
+        - Risk ≈ 0 → Low FLUX (SUCCESS)
+    
+    Failure Pattern (Sim #8 - Refusal Loop):
+        - Low Φ (no movement), Low U (confident), Low I (no new info)
+        - D'_i = D (full density), Low E_i (inefficient)
+        - Risk ≫ 0 → High FLUX (FAILURE)
+    
+    Args:
+        step_data: List of step dictionaries containing:
+                   - 'ui': normalized entropy (required)
+                   - 'phi': semantic flux (required)
+                   - 'density': state density (required)
+                   - 'innovation': innovation score (required for v4)
+        config: SAUP-Flux configuration (defaults to SAUPConfig())
+        
+    Returns:
+        dict: {
+            'flux_score': float - final trajectory score (lower is better),
+            'num_steps': int,
+            'mean_risk': float - average risk,
+            'std_risk': float - std deviation of risk,
+            'mean_grounding': float - average grounding ratio,
+            'mean_efficiency': float - average robust efficiency,
+            'mean_innovation': float - average innovation score,
+            'mean_gated_density': float - average gated density,
+            'mean_flux': float,
+            'mean_density': float,
+            'mean_ui': float,
+            'mean_weight': float,
+            'max_weighted_risk': float,
+            'mean_weighted_risk': float,
+            'risks': list[float],
+            'groundings': list[float],
+            'efficiencies': list[float],
+            'weights': list[float]
+        }
+    """
+    if config is None:
+        config = SAUPConfig()
+    
+    if not step_data:
+        return {
+            'flux_score': 0.0,
+            'num_steps': 0,
+            'mean_risk': 0.0,
+            'std_risk': 0.0,
+            'mean_grounding': 0.0,
+            'mean_efficiency': 0.0,
+            'mean_innovation': 0.0,
+            'mean_gated_density': 0.0,
+            'mean_flux': 0.0,
+            'mean_density': 0.0,
+            'mean_ui': 0.0,
+            'mean_weight': 0.0,
+            'max_weighted_risk': 0.0,
+            'mean_weighted_risk': 0.0,
+            'risks': [],
+            'groundings': [],
+            'efficiencies': [],
+            'weights': []
+        }
+    
+    risks = []
+    groundings = []
+    efficiencies = []
+    weighted_risks = []
+    fluxes = []
+    densities = []
+    gated_densities = []
+    innovations = []
+    ui_values = []
+    weights = []
+    
+    N = len(step_data)
+    
+    for idx, step in enumerate(step_data):
+        # Extract metrics
+        ui = step.get('ui', 0.0)
+        phi = step.get('phi', 0.0)
+        density = step.get('density', 0.0)
+        innovation = step.get('innovation', 0.0)  # Universal epistemic change
+        
+        # Handle None values (for backward compatibility with old simulations)
+        if innovation is None:
+            innovation = 0.0
+        
+        # Apply flux saturation (outlier robustness)
+        phi_saturated = config.flux_saturation * np.tanh(phi / config.flux_saturation)
+        
+        # Calculate Grounding Ratio: G_i = Φ_i / (U_i + ε)
+        grounding = calculate_grounding_ratio(phi_saturated, ui, config.epsilon)
+        
+        # Calculate Robust Efficiency Coefficient: E_i = G / (1 + G)
+        # This bounds the efficiency to [0, 1] preventing high-entropy bombs
+        # High grounding → E approaches 1.0 (very efficient)
+        # Low grounding → E approaches 0.0 (inefficient)
+        efficiency = grounding / (1.0 + grounding)
+        efficiency = min(1.0, efficiency)  # Clamp to [0, 1]
+        
+        # Apply Innovation Gate: D'_i = D_i × (1 - I_i)
+        # High innovation → Gated density approaches 0 (innovation protects repetition)
+        # Low innovation → Gated density = full density (repetition penalized)
+        gated_density = density * (1.0 - innovation)
+        
+        # Calculate Turn Risk: Risk_i = D'_i - E_i
+        # High gated density + Low efficiency = High risk (wasteful repetition)
+        # Low gated density + High efficiency = Low risk (productive work)
+        risk = max(gated_density - efficiency, 0.0)
+        
+        # Saturation cap: No single turn can contribute more than 3.0
+        risk = min(risk, 3.0)
+        
+        # Calculate Logistic Temporal Weight (balanced)
+        t_i = float(idx) / float(N) if N > 0 else 0.0
+        k = 6.0
+        c = 0.5
+        
+        # Sigmoid function: 1 / (1 + exp(-k×(t_i - c)))
+        z = k * (t_i - c)
+        if z >= 0:
+            w_i = 1.0 / (1.0 + np.exp(-z))
+        else:
+            exp_z = np.exp(z)
+            w_i = exp_z / (1.0 + exp_z)
+        
+        # Calculate weighted risk for this step
+        weighted_risk = w_i * risk
+        
+        risks.append(risk)
+        groundings.append(grounding)
+        efficiencies.append(efficiency)
+        weighted_risks.append(weighted_risk)
+        fluxes.append(phi)
+        densities.append(density)
+        gated_densities.append(gated_density)
+        innovations.append(innovation)
+        ui_values.append(ui)
+        weights.append(w_i)
+        
+        logger.debug(
+            f"Step {idx}: U_i={ui:.3f}, Φ_i={phi:.3f}, D_i={density:.3f}, I_i={innovation:.3f}, "
+            f"G_i={grounding:.3f}, E_i={efficiency:.3f}, D'_i={gated_density:.3f}, Risk={risk:.3f}"
+        )
+    
+    # Calculate FLUX score using MEAN-MAX HYBRID
+    mean_weighted_risk = float(np.mean(weighted_risks)) if weighted_risks else 0.0
+    max_weighted_risk = float(np.max(weighted_risks)) if weighted_risks else 0.0
+    
+    flux_score = 0.7 * mean_weighted_risk + 0.3 * max_weighted_risk
+    
+    # Calculate statistics
+    result = {
+        'flux_score': flux_score,
+        'num_steps': N,
+        'mean_risk': float(np.mean(risks)) if risks else 0.0,
+        'std_risk': float(np.std(risks)) if risks else 0.0,
+        'mean_grounding': float(np.mean(groundings)) if groundings else 0.0,
+        'mean_efficiency': float(np.mean(efficiencies)) if efficiencies else 0.0,
+        'mean_innovation': float(np.mean(innovations)) if innovations else 0.0,
+        'mean_gated_density': float(np.mean(gated_densities)) if gated_densities else 0.0,
+        'mean_flux': float(np.mean(fluxes)) if fluxes else 0.0,
+        'mean_density': float(np.mean(densities)) if densities else 0.0,
+        'mean_ui': float(np.mean(ui_values)) if ui_values else 0.0,
+        'mean_weight': float(np.mean(weights)) if weights else 0.0,
+        'max_weighted_risk': max_weighted_risk,
+        'mean_weighted_risk': mean_weighted_risk,
+        'risks': risks,
+        'groundings': groundings,
+        'efficiencies': efficiencies,
+        'weights': weights
+    }
+    
+    return result
+    """
+    Calculate REG (Robust Evidence Gating) score with harmonic gating.
+    
+    Implements the REG formula with **Harmonic Penalty** to eliminate mathematical
+    outliers caused by multiplicative explosion. Failure is only certain if the
+    agent is BOTH stagnant (repeating) AND incoherent (inference gap).
+    
+        Penalty_i = 2 × (Stagnation_i × CoherenceGap_i) / (Stagnation_i + CoherenceGap_i + ε)
+        Penalty_i = min(Penalty_i, 3.0)  [Saturation cap]
+        StepRisk_i = U_i + Penalty_i
+        REG_score = 0.7 × Mean(w_i × StepRisk_i) + 0.3 × Max(w_i × StepRisk_i)
+    
+    Where:
+        - Harmonic mean requires BOTH stagnation AND coherence gap to be high
+        - Saturation cap prevents single-turn explosions
+        - Mean-Max hybrid: Mean captures "Slow Death Spiral", Max captures "Catastrophic Break"
+        - w_i = sigmoid(k × (t_i - c)) with balanced parameters (c=0.5, k=6)
+        - U_i = normalized entropy for step i
+        - Stagnation_i = α·Da_i (information stagnation score)
+        - CoherenceGap_i = β·Do_agent_i + γ·Do_user_i
     
     Args:
         step_data: List of step dictionaries containing:
@@ -1008,23 +1188,26 @@ def calculate_saup_score(
         
     Returns:
         dict: {
-            'saup_score': float - final trajectory score (VAUP),
+            'saup_score': float - final trajectory score (REG),
             'num_steps': int - number of steps included,
-            'mean_penalty': float - average penalty across steps,
+            'mean_penalty': float - average harmonic penalty across steps,
             'std_penalty': float - std deviation of penalties,
             'mean_ui': float - average U_i across steps,
+            'mean_stagnation': float - average stagnation across steps,
             'mean_weight': float - average temporal weight,
-            'penalties': list[float] - Penalty_i for each step (for debugging),
-            'weights': list[float] - w_i for each step (for debugging)
+            'max_risk': float - maximum weighted step risk (catastrophic break),
+            'mean_risk': float - mean weighted step risk (slow death spiral),
+            'penalties': list[float] - Harmonic penalty for each step,
+            'weights': list[float] - w_i for each step
         }
     
     Example:
         >>> steps = [
-        ...     {'ui': 0.1, 'da': 0.02, 'do_agent': 0.3, 'do_user': None},
-        ...     {'ui': 0.15, 'da': 0.05, 'do_agent': None, 'do_user': 0.35}
+        ...     {'ui': 0.1, 'da': 0.9, 'do_agent': 0.9, 'do_user': None},  # High both → High penalty
+        ...     {'ui': 0.15, 'da': 0.9, 'do_agent': 0.1, 'do_user': None}  # High stag, low Do → Low penalty
         ... ]
         >>> result = calculate_saup_score(steps)
-        >>> print(f"VAUP Score: {result['saup_score']:.4f}")
+        >>> print(f"REG Score: {result['saup_score']:.4f}")
     """
     if config is None:
         config = SAUPConfig()
@@ -1036,18 +1219,24 @@ def calculate_saup_score(
             'mean_penalty': 0.0,
             'std_penalty': 0.0,
             'mean_ui': 0.0,
+            'mean_stagnation': 0.0,
             'mean_weight': 0.0,
+            'max_risk': 0.0,
+            'mean_risk': 0.0,
             'penalties': [],
             'weights': []
         }
     
-    # Calculate penalties and risk scores using additive formula
-    penalties = []
+    # Calculate harmonic penalties and risk scores
+    harmonic_penalties = []
     step_risks = []
+    weighted_risks = []
     ui_values = []
+    stagnation_values = []
     weights = []
     
     N = len(step_data)
+    epsilon = 1e-6  # Small constant to prevent division by zero
     
     for idx, step in enumerate(step_data):
         # Extract metrics
@@ -1061,27 +1250,36 @@ def calculate_saup_score(
         do_agent_val = do_agent if do_agent is not None else 0.0
         do_user_val = do_user if do_user is not None else 0.0
         
-        # Calculate standalone penalty term (additive contribution from stagnation/coherence)
-        penalty = (
-            config.alpha * da_val +
-            config.beta * do_agent_val +
-            config.gamma * do_user_val
-        )
+        # Calculate STAGNATION component (scaled by alpha)
+        stagnation = config.alpha * da_val
         
-        # Calculate step risk using additive formula
-        # This prevents signal vanishing when ui ≈ 0
-        step_risk = ui + penalty
+        # Calculate COHERENCE GAP component (Do metrics)
+        coherence_gap = config.beta * do_agent_val + config.gamma * do_user_val
         
-        # Calculate Logistic Temporal Weight
-        # w_i = sigmoid(k * (t_i - c))
+        # HARMONIC PENALTY: 2 × (A × B) / (A + B + ε)
+        # Requires BOTH stagnation AND coherence gap to be high for high penalty
+        # If either is low, penalty drops significantly
+        numerator = 2.0 * stagnation * coherence_gap
+        denominator = stagnation + coherence_gap + epsilon
+        harmonic_penalty = numerator / denominator
+        
+        # SATURATION CAP: Prevent single-turn explosions
+        # No single turn can contribute more than 3.0 to the penalty
+        harmonic_penalty = min(harmonic_penalty, 3.0)
+        
+        # Calculate step risk: U_i + Harmonic Penalty
+        step_risk = ui + harmonic_penalty
+        
+        # Calculate BALANCED Logistic Temporal Weight
+        # w_i = sigmoid(k × (t_i - c))
         # where t_i = i/N (normalized turn index in [0, 1])
-        #       c = 0.7 (center of S-curve at 70% of trajectory)
-        #       k = 12 (steepness of the curve)
+        #       c = 0.5 (center at 50% for balanced weighting)
+        #       k = 6 (moderate steepness for natural ramp)
         t_i = float(idx) / float(N) if N > 0 else 0.0
-        k = 12.0
-        c = 0.7
+        k = 6.0
+        c = 0.5
         
-        # Sigmoid function: 1 / (1 + exp(-k*(t_i - c)))
+        # Sigmoid function: 1 / (1 + exp(-k×(t_i - c)))
         z = k * (t_i - c)
         # Numerically stable sigmoid
         if z >= 0:
@@ -1090,65 +1288,66 @@ def calculate_saup_score(
             exp_z = np.exp(z)
             w_i = exp_z / (1.0 + exp_z)
         
-        penalties.append(penalty)
+        # Calculate weighted risk for this step
+        weighted_risk = w_i * step_risk
+        
+        harmonic_penalties.append(harmonic_penalty)
         step_risks.append(step_risk)
+        weighted_risks.append(weighted_risk)
         ui_values.append(ui)
+        stagnation_values.append(stagnation)
         weights.append(w_i)
     
-    # Calculate VAUP score using weighted RMS
-    sum_weights = sum(weights)
+    # Calculate REG score using MEAN-MAX HYBRID
+    # 70% Mean (captures "Slow Death Spiral") + 30% Max (captures "Catastrophic Break")
+    mean_risk = float(np.mean(weighted_risks)) if weighted_risks else 0.0
+    max_risk = float(np.max(weighted_risks)) if weighted_risks else 0.0
     
-    # Robustness: avoid division by zero
-    if sum_weights == 0 or sum_weights < 1e-8:
-        # Fallback to uniform weighting if all weights are near-zero
-        logger.warning("Sum of weights near zero, falling back to uniform weighting")
-        saup_score = np.sqrt(sum(risk ** 2 for risk in step_risks) / N)
-        mean_weight = 0.0
-    else:
-        sum_weighted_squared_risks = sum(w * (risk ** 2) for w, risk in zip(weights, step_risks))
-        saup_score = np.sqrt(sum_weighted_squared_risks / sum_weights)
-        mean_weight = float(np.mean(weights))
+    reg_score = 0.7 * mean_risk + 0.3 * max_risk
     
     # Calculate statistics
     result = {
-        'saup_score': float(saup_score),
+        'saup_score': reg_score,
         'num_steps': N,
-        'mean_penalty': float(np.mean(penalties)) if penalties else 0.0,
-        'std_penalty': float(np.std(penalties)) if penalties else 0.0,
+        'mean_penalty': float(np.mean(harmonic_penalties)) if harmonic_penalties else 0.0,
+        'std_penalty': float(np.std(harmonic_penalties)) if harmonic_penalties else 0.0,
         'mean_ui': float(np.mean(ui_values)) if ui_values else 0.0,
-        'mean_weight': mean_weight,
-        'penalties': penalties,
+        'mean_stagnation': float(np.mean(stagnation_values)) if stagnation_values else 0.0,
+        'mean_weight': float(np.mean(weights)) if weights else 0.0,
+        'max_risk': max_risk,
+        'mean_risk': mean_risk,
+        'penalties': harmonic_penalties,
         'weights': weights
     }
     
     return result
 
 
-def calculate_saup_from_trajectory(
+def calculate_flux_from_trajectory(
     messages: list,
     config: Optional[SAUPConfig] = None
 ) -> dict:
     """
-    Convenience function to calculate SAUP score directly from message objects.
+    Convenience function to calculate FLUX score directly from message objects.
     
-    Extracts U_i, Da, and Do metrics from message objects and calculates
-    the final SAUP-D trajectory score.
+    Extracts U_i, Φ_i, D_i, and I_i metrics from message objects and calculates
+    the final FLUX trajectory score with Universal Innovation Gating (v4).
     
     Args:
         messages: List of message objects (AssistantMessage, UserMessage)
-                  with uncertainty, da_score, do_score, do_type attributes
-        config: SAUP configuration (defaults to SAUPConfig())
+                  with uncertainty, phi_score, density_score, and innovation_score attributes
+        config: SAUP-Flux configuration (defaults to SAUPConfig())
         
     Returns:
-        dict: SAUP metrics (same as calculate_saup_score)
+        dict: FLUX metrics (same as calculate_flux_efficiency)
     
     Example:
         >>> # After running a simulation with --calculate-uncertainty
         >>> from tau2.data_model.simulation import Results
         >>> results = Results.load("simulation.json")
         >>> sim = results.simulations[0]
-        >>> saup = calculate_saup_from_trajectory(sim.messages)
-        >>> print(f"Trajectory Score: {saup['saup_score']:.4f}")
+        >>> flux = calculate_flux_from_trajectory(sim.messages)
+        >>> print(f"Trajectory FLUX Score: {flux['flux_score']:.4f}")
     """
     step_data = []
     
@@ -1164,25 +1363,26 @@ def calculate_saup_from_trajectory(
         # Extract U_i
         ui = msg.uncertainty.get('normalized_entropy', 0.0)
         
-        # Extract Da
-        da = msg.da_score if hasattr(msg, 'da_score') else None
+        # Extract Φ_i (semantic flux)
+        phi = msg.phi_score if hasattr(msg, 'phi_score') and msg.phi_score is not None else 0.0
         
-        # Extract Do (split by type)
-        do_agent = None
-        do_user = None
-        if hasattr(msg, 'do_score') and msg.do_score is not None:
-            if hasattr(msg, 'do_type'):
-                if msg.do_type == 'agent_coherence':
-                    do_agent = msg.do_score
-                elif msg.do_type == 'user_coherence':
-                    do_user = msg.do_score
+        # Extract D_i (state density)
+        density = msg.density_score if hasattr(msg, 'density_score') and msg.density_score is not None else 0.0
+        
+        # Extract I_i (innovation score) - v4 universal epistemic change
+        innovation = msg.innovation_score if hasattr(msg, 'innovation_score') and msg.innovation_score is not None else 0.0
         
         step_data.append({
             'ui': ui,
-            'da': da,
-            'do_agent': do_agent,
-            'do_user': do_user
+            'phi': phi,
+            'density': density,
+            'innovation': innovation
         })
     
-    return calculate_saup_score(step_data, config)
+    return calculate_flux_efficiency(step_data, config)
+
+
+# Backward compatibility aliases
+calculate_saup_score = calculate_flux_efficiency
+calculate_saup_from_trajectory = calculate_flux_from_trajectory
 

@@ -116,31 +116,19 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
     """
     Analyze a single simulation and extract uncertainty scores.
 
-    This function recalculates information stagnation metrics using the VAUP
-    (Velocity-Aware Uncertainty Propagation) approach with novelty gating to
-    distinguish enumeration from looping. It also applies strict tool repetition
-    penalties for exact duplicate tool calls.
+    This function extracts FLUX metrics (U_i, Φ_i, D_i) from simulations run
+    with the --calculate-uncertainty flag, which embed the metrics during runtime.
 
     Args:
         simulation: A simulation run dictionary
-        config: SAUP configuration for weighted aggregation
+        config: SAUP-Flux configuration for weighted aggregation
         verbose: If True, include detailed statistics
 
     Returns:
         SimulationUncertainty: Analyzed uncertainty data
     """
-    from tau2.metrics.uncertainty import (
-        calculate_information_stagnation,
-        calculate_tool_repetition
-    )
-    
     uncertainty_scores = []
     turn_counter = 0
-    
-    # Track agent history for stagnation detection (VAUP)
-    agent_text_history = []  # Text responses for information stagnation
-    agent_tool_history = []  # Tool calls for exact duplicate detection
-    global_token_set = set()  # All unique content tokens seen so far (for novelty gate)
 
     for message in simulation.get("messages", []):
         role = message.get("role")
@@ -158,57 +146,10 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
         logprobs = message.get("logprobs")
         ui_score = calculate_normalized_entropy(logprobs)
         
-        # Calculate INFORMATION STAGNATION for agent messages (VAUP)
-        da_score = None
-        if role == "assistant":
-            # Extract content
-            content = message.get("content", "")
-            if content is None:
-                content = ""
-            
-            # Calculate text-based information stagnation (novelty-gated)
-            text_stagnation = 0.0
-            if content:
-                text_stagnation = calculate_information_stagnation(
-                    content, 
-                    global_token_set,
-                    agent_text_history
-                )
-                # Update text history
-                agent_text_history.append(content)
-                
-                # Update global token set with new tokens
-                from tau2.metrics.uncertainty import STOP_WORDS
-                tokens_raw = content.lower().split()
-                for token in tokens_raw:
-                    cleaned = token.strip('.,!?;:()[]{}"\'-')
-                    if cleaned and cleaned not in STOP_WORDS:
-                        if not cleaned.replace('.', '').replace('-', '').isdigit():
-                            global_token_set.add(cleaned)
-            
-            # Calculate tool-based repetition
-            tool_repetition = 0.0
-            tool_calls = message.get("tool_calls")
-            if tool_calls:
-                tool_repetition = calculate_tool_repetition(
-                    tool_calls,
-                    agent_tool_history
-                )
-                # Update tool history
-                agent_tool_history.append(tool_calls)
-            
-            # Aggregate: take maximum (worst-case penalty)
-            # Either text stagnation OR tool duplication is a failure signal
-            da_score = max(text_stagnation, tool_repetition)
-            
-            logger.debug(
-                f"Turn {turn_counter}: text_stag={text_stagnation:.3f}, "
-                f"tool_rep={tool_repetition:.3f}, final_da={da_score:.3f}"
-            )
-        
-        # Extract inference gap (Do) metrics from pre-computed data
-        do_score = message.get("do_score")
-        do_type = message.get("do_type")
+        # Extract FLUX metrics (Φ_i, D_i, I_i) from pre-computed data
+        phi_score = message.get("phi_score")
+        density_score = message.get("density_score")
+        innovation_score = message.get("innovation_score")
 
         # Build turn data
         turn_data = TurnUncertainty(
@@ -221,9 +162,9 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
                 if message.get("content")
                 else "[tool_call]"
             ),
-            da_score=da_score,  # Information Stagnation (novelty-gated)
-            do_score=do_score,
-            do_type=do_type,
+            da_score=phi_score,  # Store flux as da_score for compatibility
+            do_score=density_score,  # Store density as do_score for compatibility
+            do_type="flux_v4" if innovation_score is not None else "flux_metrics",
         )
 
         # Add detailed statistics if requested
@@ -233,21 +174,33 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
 
         uncertainty_scores.append(turn_data)
 
-    # Calculate VAUP aggregation score (using LOGISTIC TEMPORAL WEIGHTING)
+    # Calculate FLUX aggregation score
     saup_metrics = None
     if uncertainty_scores:
-        step_data = [
-            {
+        # Build step data with proper innovation extraction
+        messages_list = [m for m in simulation.get("messages", []) if m.get("role") in ["assistant", "user"]]
+        
+        step_data = []
+        for idx, turn in enumerate(uncertainty_scores):
+            # Get corresponding message for innovation score
+            innovation = 0.0
+            if idx < len(messages_list):
+                innovation = messages_list[idx].get("innovation_score", 0.0)
+                # Handle None case (old simulations without innovation)
+                if innovation is None:
+                    innovation = 0.0
+            
+            step_data.append({
                 "ui": turn.ui_score,
-                "da": turn.da_score,  # Information stagnation score
-                "do_agent": turn.do_score if turn.do_type == "agent_coherence" else None,
-                "do_user": turn.do_score if turn.do_type == "user_coherence" else None
-            }
-            for turn in uncertainty_scores
-        ]
-        saup_result = calculate_saup_score(step_data, config)
-        # Remove penalties and weights lists (too verbose)
-        saup_metrics = {k: v for k, v in saup_result.items() if k not in ['penalties', 'weights']}
+                "phi": turn.da_score if turn.da_score is not None else 0.0,  # Flux
+                "density": turn.do_score if turn.do_score is not None else 0.0,  # Density
+                "innovation": innovation
+            })
+        
+        from tau2.metrics.uncertainty import calculate_flux_efficiency
+        flux_result = calculate_flux_efficiency(step_data, config)
+        # Remove verbose lists
+        saup_metrics = {k: v for k, v in flux_result.items() if k not in ['risks', 'groundings', 'efficiencies', 'weights']}
     
     # Extract ground truth (task success)
     ground_truth = simulation.get("reward_info", {}).get("reward", None) if simulation.get("reward_info") else None
@@ -259,11 +212,9 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
         agent_scores = [s.ui_score for s in uncertainty_scores if s.actor == "agent"]
         user_scores = [s.ui_score for s in uncertainty_scores if s.actor == "user"]
         
-        # Stagnation and coherence metrics (VAUP)
-        stagnation_scores = [s.da_score for s in uncertainty_scores if s.da_score is not None]
-        do_scores = [s.do_score for s in uncertainty_scores if s.do_score is not None]
-        do_agent_coherence = [s.do_score for s in uncertainty_scores if s.do_score is not None and s.do_type == "agent_coherence"]
-        do_user_coherence = [s.do_score for s in uncertainty_scores if s.do_score is not None and s.do_type == "user_coherence"]
+        # FLUX metrics
+        flux_scores = [s.da_score for s in uncertainty_scores if s.da_score is not None]
+        density_scores = [s.do_score for s in uncertainty_scores if s.do_score is not None]
 
         summary = {
             "mean_uncertainty_overall": float(
@@ -276,15 +227,13 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
             ),
             "agent_turn_count": len(agent_scores),
             "user_turn_count": len(user_scores),
-            # VAUP stagnation metrics
-            "mean_stagnation_score": float(np.mean(stagnation_scores)) if stagnation_scores else None,
-            "std_stagnation_score": float(np.std(stagnation_scores)) if stagnation_scores else None,
-            "mean_do_score": float(np.mean(do_scores)) if do_scores else None,
-            "std_do_score": float(np.std(do_scores)) if do_scores else None,
-            "mean_do_agent_coherence": float(np.mean(do_agent_coherence)) if do_agent_coherence else None,
-            "mean_do_user_coherence": float(np.mean(do_user_coherence)) if do_user_coherence else None,
-            "stagnation_count": len(stagnation_scores),
-            "do_count": len(do_scores),
+            # FLUX metrics
+            "mean_flux_score": float(np.mean(flux_scores)) if flux_scores else None,
+            "std_flux_score": float(np.std(flux_scores)) if flux_scores else None,
+            "mean_density_score": float(np.mean(density_scores)) if density_scores else None,
+            "std_density_score": float(np.std(density_scores)) if density_scores else None,
+            "flux_count": len(flux_scores),
+            "density_count": len(density_scores),
         }
 
     return SimulationUncertainty(
@@ -301,13 +250,13 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
 
 def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optional[AUROCMetrics]:
     """
-    Calculate AUROC metrics for VAUP failure prediction.
+    Calculate AUROC metrics for FLUX failure prediction.
     
-    Hypothesis: High VAUP score predicts task failure.
+    Hypothesis: High FLUX score predicts task failure.
     Label encoding: Failure=1, Success=0
     
     Args:
-        analyzed_sims: List of analyzed simulations with VAUP metrics
+        analyzed_sims: List of analyzed simulations with FLUX metrics
         
     Returns:
         AUROCMetrics if calculation successful, None otherwise
@@ -316,23 +265,23 @@ def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optio
         logger.warning("scikit-learn not available. Skipping AUROC calculation.")
         return None
     
-    # Extract SAUP scores and ground truth labels
+    # Extract FLUX scores and ground truth labels
     y_scores = []
     y_true = []
     
     for sim in analyzed_sims:
-        # Need both SAUP score and ground truth
+        # Need both FLUX score and ground truth
         if sim.saup_metrics is None or sim.ground_truth_pass is None:
             continue
         
-        saup_score = sim.saup_metrics.get('saup_score')
-        if saup_score is None:
+        flux_score = sim.saup_metrics.get('flux_score')
+        if flux_score is None:
             continue
         
         # Label encoding: Failure=1, Success=0
         ground_truth = 0 if sim.ground_truth_pass else 1
         
-        y_scores.append(saup_score)
+        y_scores.append(flux_score)
         y_true.append(ground_truth)
     
     # Need at least 2 samples and both classes present
@@ -523,72 +472,68 @@ def print_uncertainty_summary_from_results(
         console.print(f"  Max:  {np.max(all_user_uncertainties):.4f}")
         console.print(f"  Total turns: {len(all_user_uncertainties)}")
     
-    # Semantic distance metrics
+    # FLUX terminology (semantic distance metrics replaced)
     if all_da_scores or all_do_scores:
-        console.print("\n[bold cyan]Situational Awareness Metrics (VAUP)[/bold cyan]")
+        console.print("\n[bold cyan]FLUX Efficiency Metrics[/bold cyan]")
         
         if all_da_scores:
-            console.print("\n[bold]Information Stagnation (Novelty-Gated):[/bold]")
+            console.print("\n[bold]Semantic Flux (Φ) - Movement Between Turns:[/bold]")
             console.print(f"  Mean: {np.mean(all_da_scores):.4f}")
             console.print(f"  Std:  {np.std(all_da_scores):.4f}")
             console.print(f"  Min:  {np.min(all_da_scores):.4f}")
             console.print(f"  Max:  {np.max(all_da_scores):.4f}")
             console.print(f"  Total measurements: {len(all_da_scores)}")
-            console.print(f"  [dim]Note: Low values indicate novelty (enumeration), high values indicate stagnation (looping)[/dim]")
+            console.print(f"  [dim]Note: High flux = progress, Low flux = stagnation[/dim]")
         
         if all_do_scores:
-            console.print("\n[bold]Inference Gap (Do):[/bold]")
+            console.print("\n[bold]State Density (D) - Manifold Overlap:[/bold]")
             console.print(f"  Mean: {np.mean(all_do_scores):.4f}")
             console.print(f"  Std:  {np.std(all_do_scores):.4f}")
             console.print(f"  Min:  {np.min(all_do_scores):.4f}")
             console.print(f"  Max:  {np.max(all_do_scores):.4f}")
             console.print(f"  Total measurements: {len(all_do_scores)}")
-            
-            if all_do_agent:
-                console.print(f"\n  [dim]Agent Coherence:[/dim]")
-                console.print(f"    Mean: {np.mean(all_do_agent):.4f}")
-                console.print(f"    Count: {len(all_do_agent)}")
-            
-            if all_do_user:
-                console.print(f"\n  [dim]User Coherence:[/dim]")
-                console.print(f"    Mean: {np.mean(all_do_user):.4f}")
-                console.print(f"    Count: {len(all_do_user)}")
+            console.print(f"  [dim]Note: High density = revisiting states (failure signal)[/dim]")
+            console.print(f"  [dim]Temporal decay λ = 0.1 (exponential)[/dim]")
     
-    # VAUP Aggregation Scores
+    # FLUX Aggregation Scores
     all_saup_scores = []
     saup_passed = []
     saup_failed = []
     
     for sim in results.simulations:
         if hasattr(sim, 'saup_metrics') and sim.saup_metrics is not None:
-            saup_score = sim.saup_metrics.get('saup_score')
-            if saup_score is not None:
-                all_saup_scores.append(saup_score)
+            flux_score = sim.saup_metrics.get('flux_score')
+            if flux_score is not None:
+                all_saup_scores.append(flux_score)
                 
                 # Track by ground truth
                 if hasattr(sim, 'reward_info') and sim.reward_info is not None:
                     reward = sim.reward_info.reward
                     if reward == 1.0:
-                        saup_passed.append(saup_score)
+                        saup_passed.append(flux_score)
                     else:
-                        saup_failed.append(saup_score)
+                        saup_failed.append(flux_score)
     
     if all_saup_scores:
-        console.print("\n[bold cyan]VAUP Aggregation Scores[/bold cyan]")
-        console.print(f"  Mean VAUP: {np.mean(all_saup_scores):.4f}")
-        console.print(f"  Std VAUP:  {np.std(all_saup_scores):.4f}")
-        console.print(f"  Min VAUP:  {np.min(all_saup_scores):.4f}")
-        console.print(f"  Max VAUP:  {np.max(all_saup_scores):.4f}")
+        console.print("\n[bold cyan]FLUX Trajectory Scores (Topological Efficiency)[/bold cyan]")
+        console.print(f"  Mean FLUX: {np.mean(all_saup_scores):.4f}")
+        console.print(f"  Std FLUX:  {np.std(all_saup_scores):.4f}")
+        console.print(f"  Min FLUX:  {np.min(all_saup_scores):.4f}")
+        console.print(f"  Max FLUX:  {np.max(all_saup_scores):.4f}")
         console.print(f"  Total simulations: {len(all_saup_scores)}")
+        console.print(f"  [dim]Formula: Waste_i = (1/G_i) × D_i, where G_i = Φ_i / (U_i + ε)[/dim]")
+        console.print(f"  [dim]Aggregation: 70% Mean + 30% Max (Slow Inefficiency + Catastrophic Trap)[/dim]")
+        console.print(f"  [dim]Lower FLUX = Better (efficient movement)[/dim]")
+        console.print(f"  [dim]Higher FLUX = Worse (confident refusal trap detected)[/dim]")
         
         # Ground truth correlation
         if saup_passed or saup_failed:
             total_with_gt = len(saup_passed) + len(saup_failed)
             console.print(f"\n  Ground Truth: {len(saup_passed)}/{total_with_gt} passed ({100*len(saup_passed)/total_with_gt:.1f}%)")
             if saup_passed:
-                console.print(f"  Mean VAUP (passed): {np.mean(saup_passed):.4f}")
+                console.print(f"  Mean FLUX (passed): {np.mean(saup_passed):.4f}")
             if saup_failed:
-                console.print(f"  Mean VAUP (failed): {np.mean(saup_failed):.4f}")
+                console.print(f"  Mean FLUX (failed): {np.mean(saup_failed):.4f}")
             
             # Quick AUROC estimate (inline calculation for real-time summary)
             if SKLEARN_AVAILABLE and len(saup_passed) > 0 and len(saup_failed) > 0:
@@ -679,11 +624,9 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
             console.print(f"  Min:  {np.min(all_user_uncertainties):.4f}")
             console.print(f"  Max:  {np.max(all_user_uncertainties):.4f}")
     
-    # Semantic distance metrics
+    # FLUX metrics
     all_da_scores = []
     all_do_scores = []
-    all_do_agent = []
-    all_do_user = []
     
     for sim in analysis.results:
         for score in sim.uncertainty_scores:
@@ -691,81 +634,70 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                 all_da_scores.append(score.da_score)
             if score.do_score is not None:
                 all_do_scores.append(score.do_score)
-                if score.do_type == "agent_coherence":
-                    all_do_agent.append(score.do_score)
-                elif score.do_type == "user_coherence":
-                    all_do_user.append(score.do_score)
     
     if all_da_scores or all_do_scores:
-        console.print("\n[bold cyan]Situational Awareness Metrics (VAUP)[/bold cyan]")
+        console.print("\n[bold cyan]FLUX Efficiency Metrics[/bold cyan]")
         
         if all_da_scores:
-            console.print("\n[bold]Information Stagnation (Novelty-Gated):[/bold]")
+            console.print("\n[bold]Semantic Flux (Φ) - Movement Between Turns:[/bold]")
             console.print(f"  Mean: {np.mean(all_da_scores):.4f}")
             console.print(f"  Std:  {np.std(all_da_scores):.4f}")
             console.print(f"  Min:  {np.min(all_da_scores):.4f}")
             console.print(f"  Max:  {np.max(all_da_scores):.4f}")
             console.print(f"  Count: {len(all_da_scores)}")
-            console.print(f"  [dim]Low values = novelty (enumeration), High values = stagnation (looping)[/dim]")
+            console.print(f"  [dim]High flux = progress, Low flux = stagnation[/dim]")
         
         if all_do_scores:
-            console.print("\n[bold]Inference Gap (Do):[/bold]")
+            console.print("\n[bold]State Density (D) - Manifold Overlap:[/bold]")
             console.print(f"  Mean: {np.mean(all_do_scores):.4f}")
             console.print(f"  Std:  {np.std(all_do_scores):.4f}")
             console.print(f"  Min:  {np.min(all_do_scores):.4f}")
             console.print(f"  Max:  {np.max(all_do_scores):.4f}")
             console.print(f"  Count: {len(all_do_scores)}")
-            
-            if all_do_agent:
-                console.print(f"\n  [dim]Agent Coherence:[/dim]")
-                console.print(f"    Mean: {np.mean(all_do_agent):.4f}")
-                console.print(f"    Count: {len(all_do_agent)}")
-            
-            if all_do_user:
-                console.print(f"\n  [dim]User Coherence:[/dim]")
-                console.print(f"    Mean: {np.mean(all_do_user):.4f}")
-                console.print(f"    Count: {len(all_do_user)}")
+            console.print(f"  [dim]High density = revisiting states (failure signal)[/dim]")
     
-    # VAUP Aggregation Scores
+    # FLUX Aggregation Scores
     all_saup_scores = []
     saup_passed = []
     saup_failed = []
     
     for sim in analysis.results:
         if sim.saup_metrics is not None:
-            saup_score = sim.saup_metrics.get('saup_score')
-            if saup_score is not None:
-                all_saup_scores.append(saup_score)
+            flux_score = sim.saup_metrics.get('flux_score')
+            if flux_score is not None:
+                all_saup_scores.append(flux_score)
                 
                 # Track by ground truth
                 if sim.ground_truth_pass is not None:
                     if sim.ground_truth_pass:
-                        saup_passed.append(saup_score)
+                        saup_passed.append(flux_score)
                     else:
-                        saup_failed.append(saup_score)
+                        saup_failed.append(flux_score)
     
     if all_saup_scores:
-        console.print("\n[bold cyan]VAUP Aggregation Scores[/bold cyan]")
-        console.print(f"  Mean VAUP: {np.mean(all_saup_scores):.4f}")
-        console.print(f"  Std VAUP:  {np.std(all_saup_scores):.4f}")
-        console.print(f"  Min VAUP:  {np.min(all_saup_scores):.4f}")
-        console.print(f"  Max VAUP:  {np.max(all_saup_scores):.4f}")
+        console.print("\n[bold cyan]FLUX Trajectory Scores (Topological Efficiency)[/bold cyan]")
+        console.print(f"  Mean FLUX: {np.mean(all_saup_scores):.4f}")
+        console.print(f"  Std FLUX:  {np.std(all_saup_scores):.4f}")
+        console.print(f"  Min FLUX:  {np.min(all_saup_scores):.4f}")
+        console.print(f"  Max FLUX:  {np.max(all_saup_scores):.4f}")
         console.print(f"  Total simulations: {len(all_saup_scores)}")
+        console.print(f"  [dim]Waste = (1/G) × D, where G = Φ/(U + ε)[/dim]")
+        console.print(f"  [dim]Lower FLUX = Better (efficient), Higher FLUX = Worse (trapped)[/dim]")
         
         # Ground truth correlation
         if saup_passed or saup_failed:
             total_with_gt = len(saup_passed) + len(saup_failed)
             console.print(f"\n  Ground Truth: {len(saup_passed)}/{total_with_gt} passed ({100*len(saup_passed)/total_with_gt:.1f}%)")
             if saup_passed:
-                console.print(f"  Mean VAUP (passed): {np.mean(saup_passed):.4f}")
+                console.print(f"  Mean FLUX (passed): {np.mean(saup_passed):.4f}")
             if saup_failed:
-                console.print(f"  Mean VAUP (failed): {np.mean(saup_failed):.4f}")
+                console.print(f"  Mean FLUX (failed): {np.mean(saup_failed):.4f}")
     
     # AUROC Evaluation (Failure Prediction)
     if analysis.auroc_metrics is not None:
         auroc = analysis.auroc_metrics
         console.print("\n[bold cyan]AUROC Evaluation (Failure Prediction)[/bold cyan]")
-        console.print(f"  Hypothesis: High VAUP → High probability of failure")
+        console.print(f"  Hypothesis: High FLUX → High probability of failure")
         console.print(f"  Dataset: {auroc.num_samples} tasks ({auroc.num_failures} failures, {auroc.num_successes} successes)")
         console.print()
         
@@ -797,13 +729,13 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
         # Interpretation
         console.print()
         if auroc_value > 0.7:
-            console.print(f"  [green]✅ VAUP has {auroc_label.lower()} predictive power for task failure![/green]")
-            console.print(f"  [green]   Tasks with VAUP > {auroc.optimal_threshold:.4f} are at high risk of failure.[/green]")
+            console.print(f"  [green]✅ FLUX has {auroc_label.lower()} predictive power for task failure![/green]")
+            console.print(f"  [green]   Tasks with FLUX > {auroc.optimal_threshold:.4f} are at high risk of failure.[/green]")
         elif auroc_value > 0.6:
-            console.print(f"  [yellow]⚠️  VAUP shows fair predictive power (AUROC={auroc_value:.4f}).[/yellow]")
-            console.print(f"  [yellow]   Consider combining with other features or tuning α,β,γ weights.[/yellow]")
+            console.print(f"  [yellow]⚠️  FLUX shows fair predictive power (AUROC={auroc_value:.4f}).[/yellow]")
+            console.print(f"  [yellow]   Consider tuning ε (epsilon) or λ (decay) parameters.[/yellow]")
         else:
-            console.print(f"  [red]❌ VAUP shows poor predictive power (AUROC={auroc_value:.4f}).[/red]")
+            console.print(f"  [red]❌ FLUX shows poor predictive power (AUROC={auroc_value:.4f}).[/red]")
             if auroc.num_samples < 30:
                 console.print(f"  [yellow]   Note: Small sample size ({auroc.num_samples}) limits statistical power.[/yellow]")
             else:
@@ -827,7 +759,7 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
         
         # Display SAUP score if available
         if sim.saup_metrics:
-            console.print(f"  VAUP Score: {sim.saup_metrics['saup_score']:.4f}")
+            console.print(f"  FLUX Score: {sim.saup_metrics['flux_score']:.4f}")
             console.print(f"  Ground Truth: {'✅ Pass' if sim.ground_truth_pass else '❌ Fail' if sim.ground_truth_pass is not None else 'N/A'}\n")
         else:
             console.print()
@@ -864,34 +796,43 @@ def print_detailed_trajectory(
     
     # Display SAUP score if available
     if sim.saup_metrics:
-        console.print(f"[bold]VAUP Score:[/bold] {sim.saup_metrics['saup_score']:.4f}")
+        console.print(f"[bold]FLUX Score:[/bold] {sim.saup_metrics['flux_score']:.4f}")
         console.print(f"[bold]Ground Truth:[/bold] {'✅ Pass' if sim.ground_truth_pass else '❌ Fail' if sim.ground_truth_pass is not None else 'N/A'}")
     console.print()
 
-    # Calculate penalties for display
-    penalties = []
+    # Calculate waste scores for display
+    waste_scores = []
+    grounding_scores = []
     if sim.saup_metrics:
         config = SAUPConfig()
         for score in sim.uncertainty_scores:
-            from tau2.metrics.uncertainty import calculate_situational_weight
-            penalty = calculate_situational_weight(
-                score.da_score,
-                score.do_score if score.do_type == "agent_coherence" else None,
-                score.do_score if score.do_type == "user_coherence" else None,
-                config
-            )
-            penalties.append(penalty)
+            from tau2.metrics.uncertainty import calculate_grounding_ratio
+            # Calculate grounding
+            phi = score.da_score if score.da_score is not None else 0.0
+            density = score.do_score if score.do_score is not None else 0.0
+            ui = score.ui_score
+            
+            grounding = calculate_grounding_ratio(phi, ui, config.epsilon)
+            grounding_scores.append(grounding)
+            
+            # Calculate waste
+            if grounding < 1e-6:
+                waste = 100.0 * density
+            else:
+                waste = (1.0 / grounding) * density
+            waste = min(waste, 100.0)
+            waste_scores.append(waste)
 
     # Create table
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("Turn", style="dim", width=5)
     table.add_column("Actor", width=8)
     table.add_column("U_i", justify="right", width=8)
-    table.add_column("Stagnate", justify="right", width=8)
-    table.add_column("Do", justify="right", width=8)
-    table.add_column("Penalty", justify="right", width=8)
-    table.add_column("Do Type", width=10)
-    table.add_column("Content", width=35)
+    table.add_column("Φ (Flux)", justify="right", width=10)
+    table.add_column("D (Density)", justify="right", width=10)
+    table.add_column("G (Ground)", justify="right", width=10)
+    table.add_column("Waste", justify="right", width=8)
+    table.add_column("Content", width=25)
 
     for idx, score in enumerate(sim.uncertainty_scores):
         # Color code by uncertainty level
@@ -902,52 +843,63 @@ def print_detailed_trajectory(
         else:
             ui_color = "red"
         
-        # Color code Stagnation (da_score now stores stagnation)
-        da_str = "—"
+        # Color code Flux (da_score stores flux now)
+        phi_str = "—"
         if score.da_score is not None:
-            # Low stagnation is good (green), high is bad (red)
-            if score.da_score < 0.3:
-                da_color = "green"
-            elif score.da_score < 0.7:
-                da_color = "yellow"
+            # High flux is good (green), low is bad (red)
+            if score.da_score > 0.3:
+                phi_color = "green"
+            elif score.da_score > 0.1:
+                phi_color = "yellow"
             else:
-                da_color = "red"
-            da_str = f"[{da_color}]{score.da_score:.3f}[/{da_color}]"
+                phi_color = "red"
+            phi_str = f"[{phi_color}]{score.da_score:.3f}[/{phi_color}]"
         
-        # Color code Do (inference gap)
-        do_str = "—"
+        # Color code Density (do_score stores density)
+        density_str = "—"
         if score.do_score is not None:
+            # Low density is good (green), high is bad (red)
             if score.do_score < 0.3:
-                do_color = "green"
+                density_color = "green"
             elif score.do_score < 0.6:
-                do_color = "yellow"
+                density_color = "yellow"
             else:
-                do_color = "red"
-            do_str = f"[{do_color}]{score.do_score:.3f}[/{do_color}]"
+                density_color = "red"
+            density_str = f"[{density_color}]{score.do_score:.3f}[/{density_color}]"
         
-        # Display penalty if available
-        penalty_str = "—"
-        if penalties and idx < len(penalties):
-            penalty = penalties[idx]
-            if penalty < 0.3:
-                penalty_color = "green"
-            elif penalty < 0.6:
-                penalty_color = "yellow"
+        # Display grounding
+        grounding_str = "—"
+        if grounding_scores and idx < len(grounding_scores):
+            g = grounding_scores[idx]
+            if g > 1.0:
+                g_color = "green"
+            elif g > 0.3:
+                g_color = "yellow"
             else:
-                penalty_color = "red"
-            penalty_str = f"[{penalty_color}]{penalty:.3f}[/{penalty_color}]"
+                g_color = "red"
+            grounding_str = f"[{g_color}]{g:.3f}[/{g_color}]"
         
-        do_type_str = score.do_type[:10] if score.do_type else "—"
+        # Display waste
+        waste_str = "—"
+        if waste_scores and idx < len(waste_scores):
+            w = waste_scores[idx]
+            if w < 1.0:
+                w_color = "green"
+            elif w < 5.0:
+                w_color = "yellow"
+            else:
+                w_color = "red"
+            waste_str = f"[{w_color}]{w:.2f}[/{w_color}]"
 
         table.add_row(
             str(score.turn),
             score.actor,
             f"[{ui_color}]{score.ui_score:.3f}[/{ui_color}]",
-            da_str,
-            do_str,
-            penalty_str,
-            do_type_str,
-            score.content_preview[:35] + "...",
+            phi_str,
+            density_str,
+            grounding_str,
+            waste_str,
+            score.content_preview[:25] + "...",
         )
 
     console.print(table)
@@ -995,8 +947,8 @@ def main():
     parser.add_argument(
         "--saup-config",
         type=json.loads,
-        default='{"alpha": 5.0, "beta": 5.0, "gamma": 5.0}',
-        help='SAUP-D weight configuration (JSON format, e.g., \'{"alpha": 1.0, "beta": 1.0, "gamma": 1.0}\')',
+        default='{"epsilon": 0.01, "decay_lambda": 0.1}',
+        help='SAUP-Flux configuration (JSON format, e.g., \'{"epsilon": 0.01, "decay_lambda": 0.1}\')',
     )
     parser.add_argument(
         "--no-auroc",
@@ -1025,7 +977,7 @@ def main():
 
         # Parse SAUP configuration from CLI arguments
         saup_config = SAUPConfig(**args.saup_config)
-        console.print(f"[cyan]⚙️  SAUP Config: α={saup_config.alpha}, β={saup_config.beta}, γ={saup_config.gamma}[/cyan]")
+        console.print(f"[cyan]⚙️  FLUX Config: ε={saup_config.epsilon}, λ={saup_config.decay_lambda}[/cyan]")
 
         # Analyze
         console.print("[cyan]🔄 Analyzing trajectories and calculating uncertainty scores...[/cyan]")
