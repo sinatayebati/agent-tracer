@@ -55,19 +55,41 @@ class UncertaintyStats(BaseModel):
     mean_probability: float
 
 
+# Stop words and structural tokens to filter from entropy calculation
+STOP_WORDS = {
+    # Common stop words
+    "the", "is", "are", "was", "were", "be", "been", "being",
+    "a", "an", "to", "of", "in", "on", "at", "for", "with",
+    "from", "by", "as", "or", "and", "but", "if", "then",
+    "this", "that", "these", "those", "it", "its", "i", "you",
+    "he", "she", "we", "they", "my", "your", "his", "her",
+    "am", "can", "will", "would", "could", "should", "may",
+    "have", "has", "had", "do", "does", "did",
+    # Filler phrases (split into tokens)
+    "please", "sorry", "wait", "help", "need", "want",
+    # Structural/formatting tokens
+    "[tool_call]", "\\n", "\n", " ", "", ".", ",", "!", "?",
+    ":", ";", "-", "(", ")", "[", "]", "{", "}", "'", '"',
+}
+
+
 def calculate_normalized_entropy(logprobs_object: Optional[dict]) -> float:
     """
     Calculate the Normalized Entropy (single-step uncertainty) for a response.
 
     This metric is defined as the average token-level negative log-likelihood
-    of the generated response. It measures the uncertainty in the model's
-    generation for this specific turn.
+    of the generated response, focusing on CONTENT-BEARING tokens only.
+    
+    Filtering Strategy (fixes entropy dilution):
+    1. Filters high-probability tokens (P > 95%) - likely structural
+    2. Filters stop words and filler phrases - masks true uncertainty
+    3. Measures uncertainty only on entities, actions, and domain-specific terms
 
     Mathematically:
-        U_i = (1/|R_i|) * Σ(-log P(token_j))
+        U_i = (1/|R_i|) * Σ(-log P(token_j)) for content tokens only
 
     Where:
-        - |R_i| is the number of tokens in the response
+        - |R_i| is the number of CONTENT tokens in the response
         - -log P(token_j) is the negative log-likelihood of token j
 
     Args:
@@ -83,30 +105,33 @@ def calculate_normalized_entropy(logprobs_object: Optional[dict]) -> float:
 
     Returns:
         float: The normalized entropy (average negative log-likelihood).
-               Returns 0.0 if:
+               Returns 1e-4 if:
                - logprobs_object is None
                - No tokens are found
                - The content array is empty
+               - All tokens were filtered (response is only filler)
 
     Example:
         >>> logprobs = {
         ...     'content': [
-        ...         {'token': 'Hello', 'logprob': -0.1},
-        ...         {'token': ' world', 'logprob': -0.2},
+        ...         {'token': 'I', 'logprob': -0.01},  # Stop word, filtered
+        ...         {'token': ' am', 'logprob': -0.01},  # Stop word, filtered
+        ...         {'token': ' booking', 'logprob': -1.2},  # Content token
+        ...         {'token': ' flight', 'logprob': -0.8},  # Content token
         ...     ]
         ... }
         >>> calculate_normalized_entropy(logprobs)
-        0.15  # (0.1 + 0.2) / 2
+        1.0  # (1.2 + 0.8) / 2 - only content tokens measured
     """
     # Handle None or missing logprobs
     if logprobs_object is None:
-        return 0.0
+        return 1e-4
 
     # Extract the content array
     content = logprobs_object.get("content", [])
 
     if not content or len(content) == 0:
-        return 0.0
+        return 1e-4
 
     # Initialize counters
     total_neg_log_likelihood = 0.0
@@ -115,22 +140,42 @@ def calculate_normalized_entropy(logprobs_object: Optional[dict]) -> float:
     # Iterate through each token in the sequence
     for token_data in content:
         # Extract the logprob value
-        # Note: The API returns logprob (which is log P, a negative value)
-        # We need the negative log-likelihood, which is -log P (positive value)
         logprob = token_data.get("logprob")
+        token = token_data.get("token", "")
 
         if logprob is not None:
-            # Convert logprob to negative log-likelihood
-            # logprob = log(P) (negative)
-            # neg_log_likelihood = -log(P) (positive)
+            # Filter 1: High-probability structural tokens (P > 95%)
+            # logprob > -0.05 means P(token) > exp(-0.05) ≈ 0.951
+            if logprob > -0.05:
+                continue  # Skip structural tokens like newlines, spaces, etc.
+            
+            # Filter 2: Stop words and filler phrases
+            # Clean token: strip whitespace, lowercase, remove punctuation
+            cleaned_token = token.strip().lower()
+            # Remove leading/trailing punctuation
+            cleaned_token = cleaned_token.strip('.,!?;:()[]{}"\'-')
+            
+            # Skip if empty after cleaning
+            if not cleaned_token:
+                continue
+            
+            # Skip if it's a stop word
+            if cleaned_token in STOP_WORDS:
+                continue
+            
+            # Skip if it's purely numeric (dates, numbers, etc.)
+            if cleaned_token.replace('.', '').replace('-', '').isdigit():
+                continue
+            
+            # This is a content-bearing token - accumulate its uncertainty
             neg_log_likelihood = -logprob
-
             total_neg_log_likelihood += neg_log_likelihood
             token_count += 1
 
-    # Avoid division by zero
+    # Avoid division by zero - if all tokens were filtered, return small epsilon
+    # This indicates the response is 100% filler (a failure signal itself)
     if token_count == 0:
-        return 0.0
+        return 1e-4
 
     # Calculate and return the normalized entropy (average)
     normalized_entropy = total_neg_log_likelihood / token_count
@@ -433,12 +478,356 @@ def calculate_semantic_distance(text_a: str, text_b: str) -> float:
         return 0.0
 
 
+def calculate_jaccard_similarity(text_a: str, text_b: str) -> float:
+    """
+    Calculate Jaccard similarity between two texts (lexical overlap).
+    
+    Measures the intersection-over-union of content tokens, filtering out
+    stop words and punctuation. This captures whether the specific entities
+    and actions are identical, not just the semantic intent.
+    
+    Formula:
+        Jaccard = |tokens_a ∩ tokens_b| / |tokens_a ∪ tokens_b|
+    
+    Args:
+        text_a: First text string
+        text_b: Second text string
+        
+    Returns:
+        float: Jaccard similarity in range [0, 1] where:
+               - 0.0 = no token overlap
+               - 0.5 = moderate overlap
+               - 1.0 = identical token sets
+               Returns 0.0 if either text is empty or all tokens filtered
+    
+    Example:
+        >>> # Looping case
+        >>> jaccard = calculate_jaccard_similarity(
+        ...     "I can help with that",
+        ...     "I can help with that"
+        ... )
+        >>> # Returns ~1.0 (identical tokens)
+        
+        >>> # Enumeration case
+        >>> jaccard = calculate_jaccard_similarity(
+        ...     "Flight A123 is cancelled",
+        ...     "Flight B456 is cancelled"
+        ... )
+        >>> # Returns ~0.33 (only "Flight" and "cancelled" overlap)
+    """
+    # Handle edge cases
+    if not text_a or not text_b:
+        return 0.0
+    
+    if not text_a.strip() or not text_b.strip():
+        return 0.0
+    
+    # Tokenize: split by whitespace
+    tokens_a_raw = text_a.lower().split()
+    tokens_b_raw = text_b.lower().split()
+    
+    # Clean tokens: remove stop words and punctuation
+    def clean_token(token: str) -> str:
+        """Remove leading/trailing punctuation from token."""
+        return token.strip('.,!?;:()[]{}"\'-')
+    
+    # Filter tokens
+    tokens_a = set()
+    for token in tokens_a_raw:
+        cleaned = clean_token(token)
+        # Skip if empty, stop word, or purely numeric
+        if not cleaned or cleaned in STOP_WORDS:
+            continue
+        if cleaned.replace('.', '').replace('-', '').isdigit():
+            continue
+        tokens_a.add(cleaned)
+    
+    tokens_b = set()
+    for token in tokens_b_raw:
+        cleaned = clean_token(token)
+        if not cleaned or cleaned in STOP_WORDS:
+            continue
+        if cleaned.replace('.', '').replace('-', '').isdigit():
+            continue
+        tokens_b.add(cleaned)
+    
+    # Handle case where all tokens were filtered
+    if not tokens_a or not tokens_b:
+        return 0.0
+    
+    # Calculate Jaccard similarity
+    intersection = len(tokens_a & tokens_b)
+    union = len(tokens_a | tokens_b)
+    
+    if union == 0:
+        return 0.0
+    
+    jaccard_sim = float(intersection) / float(union)
+    
+    return jaccard_sim
+
+
+def calculate_information_stagnation(
+    current_text: str,
+    global_token_set: set[str],
+    history_texts: list[str]
+) -> float:
+    """
+    Calculate Information Stagnation score - measures lack of information gain velocity.
+    
+    This metric implements a **Novelty Gate** that distinguishes template reuse from
+    true stagnation. The agent is NOT penalized for using standard phrasing if it
+    introduces new high-value entities (flights, IDs, names, etc.).
+    
+    Formula:
+        1. Calculate Novelty Ratio: R_novel = |NewTokens| / |AllCurrentTokens|
+        2. Hard Gate: If R_novel > 0.15, return 0.0 (Progress detected)
+        3. Soft Penalty: If R_novel <= 0.15, calculate:
+           stagnation = max(CosineSim_i × (1 - R_novel)) for recent history
+    
+    The gate ensures that enumeration (same template, different entities) scores
+    near-zero stagnation, while true looping (same template, same entities) scores high.
+    
+    Args:
+        current_text: Current agent response text
+        global_token_set: Set of all unique content tokens seen in the trajectory so far
+        history_texts: List of previous agent response texts (for semantic similarity)
+                       
+    Returns:
+        float: Information stagnation score in range [0, 1] where:
+               - 0.0 = novel information introduced (R_novel > 15%)
+               - ~0.5 = moderate stagnation (some novelty, high semantic similarity)
+               - >0.8 = true stagnation (no new info, repetitive intent)
+               Returns 0.0 if history is empty or embeddings unavailable
+    
+    Example (Enumeration - Low Penalty):
+        >>> global_set = {"flight", "cancelled", "a123", "b456"}
+        >>> history = ["Flight A123 cancelled", "Flight B456 cancelled"]
+        >>> current = "Flight C789 cancelled"  # New entity: C789
+        >>> score = calculate_information_stagnation(current, global_set, history)
+        >>> # Returns ~0.0 (R_novel = 1/3 = 33% > 15%)
+    
+    Example (Looping - High Penalty):
+        >>> global_set = {"help", "assist", "today"}
+        >>> history = ["I can help with that", "Let me assist you"]
+        >>> current = "I can help with that"  # Exact repeat, no new tokens
+        >>> score = calculate_information_stagnation(current, global_set, history)
+        >>> # Returns ~0.95 (R_novel = 0%, high cosine similarity)
+    """
+    # Handle edge cases
+    if not current_text or not current_text.strip():
+        return 0.0
+    
+    if not history_texts:
+        return 0.0
+    
+    # Extract and filter current tokens
+    current_tokens_raw = current_text.lower().split()
+    current_tokens = set()
+    
+    def clean_token(token: str) -> str:
+        """Remove leading/trailing punctuation from token."""
+        return token.strip('.,!?;:()[]{}"\'-')
+    
+    for token in current_tokens_raw:
+        cleaned = clean_token(token)
+        # Skip if empty, stop word, or purely numeric
+        if not cleaned or cleaned in STOP_WORDS:
+            continue
+        if cleaned.replace('.', '').replace('-', '').isdigit():
+            continue
+        current_tokens.add(cleaned)
+    
+    # Handle case where all tokens were filtered
+    if not current_tokens:
+        return 0.0
+    
+    # Calculate Novelty Ratio: fraction of tokens that are NEW to the global set
+    new_tokens = current_tokens - global_token_set
+    R_novel = len(new_tokens) / len(current_tokens)
+    
+    logger.debug(
+        f"Novelty check: {len(new_tokens)}/{len(current_tokens)} new tokens "
+        f"(R_novel={R_novel:.3f})"
+    )
+    
+    # THE HARD GATE: If novelty exceeds 15%, this is progress (enumeration)
+    if R_novel > 0.15:
+        logger.debug(f"Novelty gate triggered (R_novel={R_novel:.3f} > 0.15). No penalty.")
+        return 0.0
+    
+    # THE SOFT PENALTY: Low novelty detected, check semantic similarity
+    # Get embedding service for semantic similarity
+    service = EmbeddingService()
+    if not service.is_available():
+        logger.debug("Embedding service not available, using novelty-only penalty")
+        # Fallback: pure novelty-based penalty
+        return float(1.0 - R_novel)
+    
+    # Get embedding for current text
+    current_embedding = service.get_embedding(current_text)
+    if current_embedding is None:
+        return float(1.0 - R_novel)
+    
+    # Look at last 3 turns (local window for stagnation detection)
+    recent_history = history_texts[-3:] if len(history_texts) > 3 else history_texts
+    
+    max_stagnation_score = 0.0
+    
+    for past_text in recent_history:
+        if not past_text or not past_text.strip():
+            continue
+        
+        # Calculate semantic similarity (cosine)
+        past_embedding = service.get_embedding(past_text)
+        if past_embedding is None:
+            continue
+        
+        try:
+            norm_current = np.linalg.norm(current_embedding)
+            norm_past = np.linalg.norm(past_embedding)
+            
+            if norm_current == 0 or norm_past == 0:
+                continue
+            
+            # Cosine similarity
+            cosine_sim = np.dot(current_embedding, past_embedding) / (norm_current * norm_past)
+            cosine_sim = max(0.0, min(1.0, float(cosine_sim)))
+            
+            # Stagnation formula: Semantic similarity × (lack of novelty)
+            # This penalizes "same intent + no new info"
+            stagnation = cosine_sim * (1.0 - R_novel)
+            
+            # Track maximum (worst-case stagnation)
+            max_stagnation_score = max(max_stagnation_score, stagnation)
+            
+            logger.debug(
+                f"Stagnation check: cosine={cosine_sim:.3f}, R_novel={R_novel:.3f}, "
+                f"stagnation={stagnation:.3f}"
+            )
+        except Exception as e:
+            logger.error(f"Error calculating information stagnation: {e}")
+            continue
+    
+    return max_stagnation_score
+
+
+def calculate_tool_repetition(
+    current_tool_calls: list,
+    tool_call_history: list[list]
+) -> float:
+    """
+    Calculate Tool Repetition penalty for exact duplicate tool calls.
+    
+    Exact duplicate tool calls (same name + same arguments) are always logical
+    failures - the agent is stuck retrying the same failed operation.
+    
+    Formula:
+        ToolRepetition = 1.0 if exact duplicate found in recent history, else 0.0
+    
+    Args:
+        current_tool_calls: List of current tool call objects/dicts with
+                           'name' and 'arguments' fields
+        tool_call_history: List of past tool call lists (from last 5 turns)
+                          Each element is a list of tool calls from one turn
+                       
+    Returns:
+        float: Tool repetition score:
+               - 1.0 = exact duplicate found (failure signal)
+               - 0.0 = no duplicates (valid)
+    
+    Example (Duplicate - High Penalty):
+        >>> current = [{'name': 'get_flight', 'arguments': {'id': 'A123'}}]
+        >>> history = [
+        ...     [{'name': 'get_flight', 'arguments': {'id': 'A123'}}],
+        ...     [{'name': 'cancel_flight', 'arguments': {'id': 'B456'}}]
+        ... ]
+        >>> score = calculate_tool_repetition(current, history)
+        >>> # Returns 1.0 (exact duplicate in history)
+    
+    Example (Different Args - No Penalty):
+        >>> current = [{'name': 'get_flight', 'arguments': {'id': 'B456'}}]
+        >>> history = [
+        ...     [{'name': 'get_flight', 'arguments': {'id': 'A123'}}]
+        ... ]
+        >>> score = calculate_tool_repetition(current, history)
+        >>> # Returns 0.0 (different arguments)
+    """
+    if not current_tool_calls:
+        return 0.0
+    
+    if not tool_call_history:
+        return 0.0
+    
+    # Create signatures for current tool calls
+    def create_tool_signature(tool_call) -> str:
+        """Create a unique signature for a tool call."""
+        try:
+            # Handle both dict and object formats
+            if isinstance(tool_call, dict):
+                name = tool_call.get('name', '')
+                arguments = tool_call.get('arguments', {})
+            else:
+                name = getattr(tool_call, 'name', '')
+                arguments = getattr(tool_call, 'arguments', {})
+            
+            # Sort arguments for consistent hashing
+            if isinstance(arguments, dict):
+                sorted_args = sorted(arguments.items())
+            elif isinstance(arguments, str):
+                # Arguments might be JSON string
+                try:
+                    import json
+                    args_dict = json.loads(arguments)
+                    sorted_args = sorted(args_dict.items())
+                except:
+                    sorted_args = [(arguments,)]
+            else:
+                sorted_args = [(str(arguments),)]
+            
+            # Create signature: name + sorted arguments
+            signature = f"{name}:{sorted_args}"
+            return signature
+        except Exception as e:
+            logger.debug(f"Error creating tool signature: {e}")
+            return ""
+    
+    # Get signatures for current tool calls
+    current_signatures = set()
+    for tool_call in current_tool_calls:
+        sig = create_tool_signature(tool_call)
+        if sig:
+            current_signatures.add(sig)
+    
+    if not current_signatures:
+        return 0.0
+    
+    # Check against recent history (last 5 turns)
+    recent_history = tool_call_history[-5:] if len(tool_call_history) > 5 else tool_call_history
+    
+    for past_tool_calls in recent_history:
+        if not past_tool_calls:
+            continue
+        
+        # Get signatures for this historical turn
+        for past_tool_call in past_tool_calls:
+            past_sig = create_tool_signature(past_tool_call)
+            if past_sig and past_sig in current_signatures:
+                # Found exact duplicate!
+                logger.debug(f"Tool repetition detected: {past_sig}")
+                return 1.0
+    
+    return 0.0
+
+
 def calculate_inquiry_drift(
     user_instruction: str,
     history_so_far: list[str]
 ) -> float:
     """
     Calculate Inquiry Drift (Da) - semantic distance from initial goal.
+    
+    **DEPRECATED:** This metric is flawed for task-oriented dialogue
     
     Measures how much the conversation has drifted from the original user
     instruction/goal. This is computed by comparing the initial instruction
@@ -549,13 +938,14 @@ def calculate_situational_weight(
     config: SAUPConfig
 ) -> float:
     """
-    Calculate situational weight W_i for a single step.
+    Calculate situational penalty for a single step (additive component).
     
-    The weight combines semantic distance metrics (Da, Do) to measure
+    The penalty combines semantic distance metrics (Da, Do) to measure
     how "risky" or "uncertain" the situational context is at step i.
+    This is now used as an additive term rather than a multiplicative weight.
     
     Formula:
-        W_i = alpha * Da_i + beta * Do_agent_i + gamma * Do_user_i
+        Penalty_i = alpha * Da_i + beta * Do_agent_i + gamma * Do_user_i
     
     Args:
         da: Inquiry drift score (None treated as 0.0)
@@ -564,11 +954,11 @@ def calculate_situational_weight(
         config: SAUP configuration with alpha, beta, gamma weights
         
     Returns:
-        float: Situational weight W_i >= 0
+        float: Situational penalty >= 0
     
     Example:
         >>> config = SAUPConfig(alpha=1.0, beta=1.0, gamma=1.0)
-        >>> w = calculate_situational_weight(0.2, 0.3, None, config)
+        >>> penalty = calculate_situational_weight(0.2, 0.3, None, config)
         >>> # Returns: 1.0*0.2 + 1.0*0.3 + 1.0*0.0 = 0.5
     """
     # Handle None values (treat as 0.0)
@@ -576,14 +966,14 @@ def calculate_situational_weight(
     do_agent_val = do_agent if do_agent is not None else 0.0
     do_user_val = do_user if do_user is not None else 0.0
     
-    # Linear combination
-    weight = 1.0 + (
+    # Linear combination (additive penalty)
+    penalty = (
         config.alpha * da_val +
         config.beta * do_agent_val +
         config.gamma * do_user_val
     )
     
-    return float(weight)
+    return float(penalty)
 
 
 def calculate_saup_score(
@@ -591,41 +981,50 @@ def calculate_saup_score(
     config: Optional[SAUPConfig] = None
 ) -> dict:
     """
-    Calculate SAUP-D aggregation score for a trajectory using weighted RMS.
+    Calculate VAUP (Velocity-Aware Uncertainty Propagation) aggregation score.
     
-    Implements the core SAUP-D formula (Equation 1 from paper):
-        U_trajectory = sqrt( (1/N) * sum((W_i * U_i)^2) )
+    Implements the VAUP formula with **Logistic Temporal Weighting** to focus
+    analysis on the "Critical Action Phase" (middle 40%-90% of trajectory):
+    
+        U_trajectory = sqrt( (sum(w_i * (U_i + Penalty_i)^2)) / sum(w_i) )
     
     Where:
-        - N = number of steps
-        - W_i = situational weight for step i
+        - w_i = sigmoid(12 * (t_i - 0.7)) with t_i = i/N (normalized turn index)
         - U_i = normalized entropy for step i
+        - Penalty_i = α·Da_i + β·Do_agent_i + γ·Do_user_i
+    
+    The logistic weighting creates an S-curve that:
+    - De-emphasizes early turns (setup phase, low risk)
+    - Emphasizes middle turns 40%-90% (critical decision phase)
+    - De-emphasizes late turns (cleanup phase, outcome already determined)
     
     Args:
         step_data: List of step dictionaries containing:
                    - 'ui': normalized entropy (required)
-                   - 'da': inquiry drift (optional)
+                   - 'da': information stagnation (optional)
                    - 'do_agent': agent coherence (optional)
                    - 'do_user': user coherence (optional)
         config: SAUP configuration (defaults to SAUPConfig())
         
     Returns:
         dict: {
-            'saup_score': float - final trajectory score,
+            'saup_score': float - final trajectory score (VAUP),
             'num_steps': int - number of steps included,
-            'mean_weight': float - average W_i across steps,
-            'std_weight': float - std deviation of weights,
+            'mean_penalty': float - average penalty across steps,
+            'std_penalty': float - std deviation of penalties,
             'mean_ui': float - average U_i across steps,
-            'weights': list[float] - W_i for each step (for debugging)
+            'mean_weight': float - average temporal weight,
+            'penalties': list[float] - Penalty_i for each step (for debugging),
+            'weights': list[float] - w_i for each step (for debugging)
         }
     
     Example:
         >>> steps = [
-        ...     {'ui': 0.1, 'da': 0.2, 'do_agent': 0.3, 'do_user': None},
-        ...     {'ui': 0.15, 'da': 0.25, 'do_agent': None, 'do_user': 0.35}
+        ...     {'ui': 0.1, 'da': 0.02, 'do_agent': 0.3, 'do_user': None},
+        ...     {'ui': 0.15, 'da': 0.05, 'do_agent': None, 'do_user': 0.35}
         ... ]
         >>> result = calculate_saup_score(steps)
-        >>> print(f"SAUP Score: {result['saup_score']:.4f}")
+        >>> print(f"VAUP Score: {result['saup_score']:.4f}")
     """
     if config is None:
         config = SAUPConfig()
@@ -634,47 +1033,91 @@ def calculate_saup_score(
         return {
             'saup_score': 0.0,
             'num_steps': 0,
-            'mean_weight': 0.0,
-            'std_weight': 0.0,
+            'mean_penalty': 0.0,
+            'std_penalty': 0.0,
             'mean_ui': 0.0,
+            'mean_weight': 0.0,
+            'penalties': [],
             'weights': []
         }
     
-    # Calculate weights and weighted squared terms
-    weights = []
-    weighted_squared_terms = []
+    # Calculate penalties and risk scores using additive formula
+    penalties = []
+    step_risks = []
     ui_values = []
+    weights = []
     
-    for step in step_data:
+    N = len(step_data)
+    
+    for idx, step in enumerate(step_data):
         # Extract metrics
         ui = step.get('ui', 0.0)
         da = step.get('da')
         do_agent = step.get('do_agent')
         do_user = step.get('do_user')
         
-        # Calculate situational weight
-        w_i = calculate_situational_weight(da, do_agent, do_user, config)
+        # Handle None values (treat as 0.0)
+        da_val = da if da is not None else 0.0
+        do_agent_val = do_agent if do_agent is not None else 0.0
+        do_user_val = do_user if do_user is not None else 0.0
         
-        # Calculate weighted squared term: (W_i * U_i)^2
-        weighted_term = w_i * ui
-        weighted_squared = weighted_term ** 2
+        # Calculate standalone penalty term (additive contribution from stagnation/coherence)
+        penalty = (
+            config.alpha * da_val +
+            config.beta * do_agent_val +
+            config.gamma * do_user_val
+        )
         
-        weights.append(w_i)
-        weighted_squared_terms.append(weighted_squared)
+        # Calculate step risk using additive formula
+        # This prevents signal vanishing when ui ≈ 0
+        step_risk = ui + penalty
+        
+        # Calculate Logistic Temporal Weight
+        # w_i = sigmoid(k * (t_i - c))
+        # where t_i = i/N (normalized turn index in [0, 1])
+        #       c = 0.7 (center of S-curve at 70% of trajectory)
+        #       k = 12 (steepness of the curve)
+        t_i = float(idx) / float(N) if N > 0 else 0.0
+        k = 12.0
+        c = 0.7
+        
+        # Sigmoid function: 1 / (1 + exp(-k*(t_i - c)))
+        z = k * (t_i - c)
+        # Numerically stable sigmoid
+        if z >= 0:
+            w_i = 1.0 / (1.0 + np.exp(-z))
+        else:
+            exp_z = np.exp(z)
+            w_i = exp_z / (1.0 + exp_z)
+        
+        penalties.append(penalty)
+        step_risks.append(step_risk)
         ui_values.append(ui)
+        weights.append(w_i)
     
-    # Calculate SAUP score using weighted RMS formula
-    N = len(step_data)
-    sum_weighted_squared = sum(weighted_squared_terms)
-    saup_score = np.sqrt(sum_weighted_squared / N)
+    # Calculate VAUP score using weighted RMS
+    sum_weights = sum(weights)
+    
+    # Robustness: avoid division by zero
+    if sum_weights == 0 or sum_weights < 1e-8:
+        # Fallback to uniform weighting if all weights are near-zero
+        logger.warning("Sum of weights near zero, falling back to uniform weighting")
+        saup_score = np.sqrt(sum(risk ** 2 for risk in step_risks) / N)
+        mean_weight = 0.0
+    else:
+        sum_weighted_squared_risks = sum(w * (risk ** 2) for w, risk in zip(weights, step_risks))
+        saup_score = np.sqrt(sum_weighted_squared_risks / sum_weights)
+        mean_weight = float(np.mean(weights))
     
     # Calculate statistics
     result = {
         'saup_score': float(saup_score),
         'num_steps': N,
-        'mean_weight': float(np.mean(weights)) if weights else 0.0,
-        'std_weight': float(np.std(weights)) if weights else 0.0,
+        'mean_penalty': float(np.mean(penalties)) if penalties else 0.0,
+        'std_penalty': float(np.std(penalties)) if penalties else 0.0,
         'mean_ui': float(np.mean(ui_values)) if ui_values else 0.0,
+        'mean_weight': mean_weight,
+        'penalties': penalties,
         'weights': weights
     }
     

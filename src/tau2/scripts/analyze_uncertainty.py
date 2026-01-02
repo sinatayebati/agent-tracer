@@ -112,19 +112,35 @@ class UncertaintyAnalysis(BaseModel):
     auroc_metrics: Optional[AUROCMetrics] = None
 
 
-def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUncertainty:
+def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = False) -> SimulationUncertainty:
     """
     Analyze a single simulation and extract uncertainty scores.
 
+    This function recalculates information stagnation metrics using the VAUP
+    (Velocity-Aware Uncertainty Propagation) approach with novelty gating to
+    distinguish enumeration from looping. It also applies strict tool repetition
+    penalties for exact duplicate tool calls.
+
     Args:
         simulation: A simulation run dictionary
+        config: SAUP configuration for weighted aggregation
         verbose: If True, include detailed statistics
 
     Returns:
         SimulationUncertainty: Analyzed uncertainty data
     """
+    from tau2.metrics.uncertainty import (
+        calculate_information_stagnation,
+        calculate_tool_repetition
+    )
+    
     uncertainty_scores = []
     turn_counter = 0
+    
+    # Track agent history for stagnation detection (VAUP)
+    agent_text_history = []  # Text responses for information stagnation
+    agent_tool_history = []  # Tool calls for exact duplicate detection
+    global_token_set = set()  # All unique content tokens seen so far (for novelty gate)
 
     for message in simulation.get("messages", []):
         role = message.get("role")
@@ -142,8 +158,55 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
         logprobs = message.get("logprobs")
         ui_score = calculate_normalized_entropy(logprobs)
         
-        # Extract semantic distance metrics
-        da_score = message.get("da_score")
+        # Calculate INFORMATION STAGNATION for agent messages (VAUP)
+        da_score = None
+        if role == "assistant":
+            # Extract content
+            content = message.get("content", "")
+            if content is None:
+                content = ""
+            
+            # Calculate text-based information stagnation (novelty-gated)
+            text_stagnation = 0.0
+            if content:
+                text_stagnation = calculate_information_stagnation(
+                    content, 
+                    global_token_set,
+                    agent_text_history
+                )
+                # Update text history
+                agent_text_history.append(content)
+                
+                # Update global token set with new tokens
+                from tau2.metrics.uncertainty import STOP_WORDS
+                tokens_raw = content.lower().split()
+                for token in tokens_raw:
+                    cleaned = token.strip('.,!?;:()[]{}"\'-')
+                    if cleaned and cleaned not in STOP_WORDS:
+                        if not cleaned.replace('.', '').replace('-', '').isdigit():
+                            global_token_set.add(cleaned)
+            
+            # Calculate tool-based repetition
+            tool_repetition = 0.0
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                tool_repetition = calculate_tool_repetition(
+                    tool_calls,
+                    agent_tool_history
+                )
+                # Update tool history
+                agent_tool_history.append(tool_calls)
+            
+            # Aggregate: take maximum (worst-case penalty)
+            # Either text stagnation OR tool duplication is a failure signal
+            da_score = max(text_stagnation, tool_repetition)
+            
+            logger.debug(
+                f"Turn {turn_counter}: text_stag={text_stagnation:.3f}, "
+                f"tool_rep={tool_repetition:.3f}, final_da={da_score:.3f}"
+            )
+        
+        # Extract inference gap (Do) metrics from pre-computed data
         do_score = message.get("do_score")
         do_type = message.get("do_type")
 
@@ -158,7 +221,7 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
                 if message.get("content")
                 else "[tool_call]"
             ),
-            da_score=da_score,
+            da_score=da_score,  # Information Stagnation (novelty-gated)
             do_score=do_score,
             do_type=do_type,
         )
@@ -170,21 +233,21 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
 
         uncertainty_scores.append(turn_data)
 
-    # Calculate SAUP-D aggregation score
+    # Calculate VAUP aggregation score (using LOGISTIC TEMPORAL WEIGHTING)
     saup_metrics = None
     if uncertainty_scores:
         step_data = [
             {
                 "ui": turn.ui_score,
-                "da": turn.da_score,
+                "da": turn.da_score,  # Information stagnation score
                 "do_agent": turn.do_score if turn.do_type == "agent_coherence" else None,
                 "do_user": turn.do_score if turn.do_type == "user_coherence" else None
             }
             for turn in uncertainty_scores
         ]
-        saup_result = calculate_saup_score(step_data, SAUPConfig())
-        # Remove weights list (too verbose)
-        saup_metrics = {k: v for k, v in saup_result.items() if k != 'weights'}
+        saup_result = calculate_saup_score(step_data, config)
+        # Remove penalties and weights lists (too verbose)
+        saup_metrics = {k: v for k, v in saup_result.items() if k not in ['penalties', 'weights']}
     
     # Extract ground truth (task success)
     ground_truth = simulation.get("reward_info", {}).get("reward", None) if simulation.get("reward_info") else None
@@ -196,8 +259,8 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
         agent_scores = [s.ui_score for s in uncertainty_scores if s.actor == "agent"]
         user_scores = [s.ui_score for s in uncertainty_scores if s.actor == "user"]
         
-        # Semantic distance metrics
-        da_scores = [s.da_score for s in uncertainty_scores if s.da_score is not None]
+        # Stagnation and coherence metrics (VAUP)
+        stagnation_scores = [s.da_score for s in uncertainty_scores if s.da_score is not None]
         do_scores = [s.do_score for s in uncertainty_scores if s.do_score is not None]
         do_agent_coherence = [s.do_score for s in uncertainty_scores if s.do_score is not None and s.do_type == "agent_coherence"]
         do_user_coherence = [s.do_score for s in uncertainty_scores if s.do_score is not None and s.do_type == "user_coherence"]
@@ -213,14 +276,14 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
             ),
             "agent_turn_count": len(agent_scores),
             "user_turn_count": len(user_scores),
-            # Semantic distance metrics
-            "mean_da_score": float(np.mean(da_scores)) if da_scores else None,
-            "std_da_score": float(np.std(da_scores)) if da_scores else None,
+            # VAUP stagnation metrics
+            "mean_stagnation_score": float(np.mean(stagnation_scores)) if stagnation_scores else None,
+            "std_stagnation_score": float(np.std(stagnation_scores)) if stagnation_scores else None,
             "mean_do_score": float(np.mean(do_scores)) if do_scores else None,
             "std_do_score": float(np.std(do_scores)) if do_scores else None,
             "mean_do_agent_coherence": float(np.mean(do_agent_coherence)) if do_agent_coherence else None,
             "mean_do_user_coherence": float(np.mean(do_user_coherence)) if do_user_coherence else None,
-            "da_count": len(da_scores),
+            "stagnation_count": len(stagnation_scores),
             "do_count": len(do_scores),
         }
 
@@ -238,13 +301,13 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
 
 def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optional[AUROCMetrics]:
     """
-    Calculate AUROC metrics for SAUP-D failure prediction.
+    Calculate AUROC metrics for VAUP failure prediction.
     
-    Hypothesis: High SAUP-D score predicts task failure.
+    Hypothesis: High VAUP score predicts task failure.
     Label encoding: Failure=1, Success=0
     
     Args:
-        analyzed_sims: List of analyzed simulations with SAUP metrics
+        analyzed_sims: List of analyzed simulations with VAUP metrics
         
     Returns:
         AUROCMetrics if calculation successful, None otherwise
@@ -332,12 +395,13 @@ def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optio
         return None
 
 
-def analyze_results(results: Results, verbose: bool = False, calculate_auroc: bool = True) -> UncertaintyAnalysis:
+def analyze_results(results: Results, config: SAUPConfig, verbose: bool = False, calculate_auroc: bool = True) -> UncertaintyAnalysis:
     """
     Analyze all simulations in the results.
 
     Args:
         results: Tau-2 simulation results
+        config: SAUP configuration for weighted aggregation
         verbose: If True, include detailed statistics
         calculate_auroc: If True, calculate AUROC metrics for failure prediction
 
@@ -348,7 +412,7 @@ def analyze_results(results: Results, verbose: bool = False, calculate_auroc: bo
 
     for simulation in results.simulations:
         sim_dict = simulation.model_dump()
-        analyzed = analyze_simulation(sim_dict, verbose=verbose)
+        analyzed = analyze_simulation(sim_dict, config, verbose=verbose)
         analyzed_sims.append(analyzed)
 
     # Create metadata
@@ -461,15 +525,16 @@ def print_uncertainty_summary_from_results(
     
     # Semantic distance metrics
     if all_da_scores or all_do_scores:
-        console.print("\n[bold cyan]Semantic Distance Metrics[/bold cyan]")
+        console.print("\n[bold cyan]Situational Awareness Metrics (VAUP)[/bold cyan]")
         
         if all_da_scores:
-            console.print("\n[bold]Inquiry Drift (Da):[/bold]")
+            console.print("\n[bold]Information Stagnation (Novelty-Gated):[/bold]")
             console.print(f"  Mean: {np.mean(all_da_scores):.4f}")
             console.print(f"  Std:  {np.std(all_da_scores):.4f}")
             console.print(f"  Min:  {np.min(all_da_scores):.4f}")
             console.print(f"  Max:  {np.max(all_da_scores):.4f}")
             console.print(f"  Total measurements: {len(all_da_scores)}")
+            console.print(f"  [dim]Note: Low values indicate novelty (enumeration), high values indicate stagnation (looping)[/dim]")
         
         if all_do_scores:
             console.print("\n[bold]Inference Gap (Do):[/bold]")
@@ -489,7 +554,7 @@ def print_uncertainty_summary_from_results(
                 console.print(f"    Mean: {np.mean(all_do_user):.4f}")
                 console.print(f"    Count: {len(all_do_user)}")
     
-    # SAUP-D Aggregation Scores
+    # VAUP Aggregation Scores
     all_saup_scores = []
     saup_passed = []
     saup_failed = []
@@ -509,11 +574,11 @@ def print_uncertainty_summary_from_results(
                         saup_failed.append(saup_score)
     
     if all_saup_scores:
-        console.print("\n[bold cyan]SAUP-D Aggregation Scores[/bold cyan]")
-        console.print(f"  Mean SAUP: {np.mean(all_saup_scores):.4f}")
-        console.print(f"  Std SAUP:  {np.std(all_saup_scores):.4f}")
-        console.print(f"  Min SAUP:  {np.min(all_saup_scores):.4f}")
-        console.print(f"  Max SAUP:  {np.max(all_saup_scores):.4f}")
+        console.print("\n[bold cyan]VAUP Aggregation Scores[/bold cyan]")
+        console.print(f"  Mean VAUP: {np.mean(all_saup_scores):.4f}")
+        console.print(f"  Std VAUP:  {np.std(all_saup_scores):.4f}")
+        console.print(f"  Min VAUP:  {np.min(all_saup_scores):.4f}")
+        console.print(f"  Max VAUP:  {np.max(all_saup_scores):.4f}")
         console.print(f"  Total simulations: {len(all_saup_scores)}")
         
         # Ground truth correlation
@@ -521,9 +586,9 @@ def print_uncertainty_summary_from_results(
             total_with_gt = len(saup_passed) + len(saup_failed)
             console.print(f"\n  Ground Truth: {len(saup_passed)}/{total_with_gt} passed ({100*len(saup_passed)/total_with_gt:.1f}%)")
             if saup_passed:
-                console.print(f"  Mean SAUP (passed): {np.mean(saup_passed):.4f}")
+                console.print(f"  Mean VAUP (passed): {np.mean(saup_passed):.4f}")
             if saup_failed:
-                console.print(f"  Mean SAUP (failed): {np.mean(saup_failed):.4f}")
+                console.print(f"  Mean VAUP (failed): {np.mean(saup_failed):.4f}")
             
             # Quick AUROC estimate (inline calculation for real-time summary)
             if SKLEARN_AVAILABLE and len(saup_passed) > 0 and len(saup_failed) > 0:
@@ -632,15 +697,16 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                     all_do_user.append(score.do_score)
     
     if all_da_scores or all_do_scores:
-        console.print("\n[bold cyan]Semantic Distance Metrics[/bold cyan]")
+        console.print("\n[bold cyan]Situational Awareness Metrics (VAUP)[/bold cyan]")
         
         if all_da_scores:
-            console.print("\n[bold]Inquiry Drift (Da):[/bold]")
+            console.print("\n[bold]Information Stagnation (Novelty-Gated):[/bold]")
             console.print(f"  Mean: {np.mean(all_da_scores):.4f}")
             console.print(f"  Std:  {np.std(all_da_scores):.4f}")
             console.print(f"  Min:  {np.min(all_da_scores):.4f}")
             console.print(f"  Max:  {np.max(all_da_scores):.4f}")
             console.print(f"  Count: {len(all_da_scores)}")
+            console.print(f"  [dim]Low values = novelty (enumeration), High values = stagnation (looping)[/dim]")
         
         if all_do_scores:
             console.print("\n[bold]Inference Gap (Do):[/bold]")
@@ -660,7 +726,7 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                 console.print(f"    Mean: {np.mean(all_do_user):.4f}")
                 console.print(f"    Count: {len(all_do_user)}")
     
-    # SAUP-D Aggregation Scores
+    # VAUP Aggregation Scores
     all_saup_scores = []
     saup_passed = []
     saup_failed = []
@@ -679,11 +745,11 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                         saup_failed.append(saup_score)
     
     if all_saup_scores:
-        console.print("\n[bold cyan]SAUP-D Aggregation Scores[/bold cyan]")
-        console.print(f"  Mean SAUP: {np.mean(all_saup_scores):.4f}")
-        console.print(f"  Std SAUP:  {np.std(all_saup_scores):.4f}")
-        console.print(f"  Min SAUP:  {np.min(all_saup_scores):.4f}")
-        console.print(f"  Max SAUP:  {np.max(all_saup_scores):.4f}")
+        console.print("\n[bold cyan]VAUP Aggregation Scores[/bold cyan]")
+        console.print(f"  Mean VAUP: {np.mean(all_saup_scores):.4f}")
+        console.print(f"  Std VAUP:  {np.std(all_saup_scores):.4f}")
+        console.print(f"  Min VAUP:  {np.min(all_saup_scores):.4f}")
+        console.print(f"  Max VAUP:  {np.max(all_saup_scores):.4f}")
         console.print(f"  Total simulations: {len(all_saup_scores)}")
         
         # Ground truth correlation
@@ -691,15 +757,15 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
             total_with_gt = len(saup_passed) + len(saup_failed)
             console.print(f"\n  Ground Truth: {len(saup_passed)}/{total_with_gt} passed ({100*len(saup_passed)/total_with_gt:.1f}%)")
             if saup_passed:
-                console.print(f"  Mean SAUP (passed): {np.mean(saup_passed):.4f}")
+                console.print(f"  Mean VAUP (passed): {np.mean(saup_passed):.4f}")
             if saup_failed:
-                console.print(f"  Mean SAUP (failed): {np.mean(saup_failed):.4f}")
+                console.print(f"  Mean VAUP (failed): {np.mean(saup_failed):.4f}")
     
     # AUROC Evaluation (Failure Prediction)
     if analysis.auroc_metrics is not None:
         auroc = analysis.auroc_metrics
         console.print("\n[bold cyan]AUROC Evaluation (Failure Prediction)[/bold cyan]")
-        console.print(f"  Hypothesis: High SAUP-D → High probability of failure")
+        console.print(f"  Hypothesis: High VAUP → High probability of failure")
         console.print(f"  Dataset: {auroc.num_samples} tasks ({auroc.num_failures} failures, {auroc.num_successes} successes)")
         console.print()
         
@@ -731,13 +797,13 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
         # Interpretation
         console.print()
         if auroc_value > 0.7:
-            console.print(f"  [green]✅ SAUP-D has {auroc_label.lower()} predictive power for task failure![/green]")
-            console.print(f"  [green]   Tasks with SAUP-D > {auroc.optimal_threshold:.4f} are at high risk of failure.[/green]")
+            console.print(f"  [green]✅ VAUP has {auroc_label.lower()} predictive power for task failure![/green]")
+            console.print(f"  [green]   Tasks with VAUP > {auroc.optimal_threshold:.4f} are at high risk of failure.[/green]")
         elif auroc_value > 0.6:
-            console.print(f"  [yellow]⚠️  SAUP-D shows fair predictive power (AUROC={auroc_value:.4f}).[/yellow]")
+            console.print(f"  [yellow]⚠️  VAUP shows fair predictive power (AUROC={auroc_value:.4f}).[/yellow]")
             console.print(f"  [yellow]   Consider combining with other features or tuning α,β,γ weights.[/yellow]")
         else:
-            console.print(f"  [red]❌ SAUP-D shows poor predictive power (AUROC={auroc_value:.4f}).[/red]")
+            console.print(f"  [red]❌ VAUP shows poor predictive power (AUROC={auroc_value:.4f}).[/red]")
             if auroc.num_samples < 30:
                 console.print(f"  [yellow]   Note: Small sample size ({auroc.num_samples}) limits statistical power.[/yellow]")
             else:
@@ -761,7 +827,7 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
         
         # Display SAUP score if available
         if sim.saup_metrics:
-            console.print(f"  SAUP Score: {sim.saup_metrics['saup_score']:.4f}")
+            console.print(f"  VAUP Score: {sim.saup_metrics['saup_score']:.4f}")
             console.print(f"  Ground Truth: {'✅ Pass' if sim.ground_truth_pass else '❌ Fail' if sim.ground_truth_pass is not None else 'N/A'}\n")
         else:
             console.print()
@@ -798,32 +864,32 @@ def print_detailed_trajectory(
     
     # Display SAUP score if available
     if sim.saup_metrics:
-        console.print(f"[bold]SAUP Score:[/bold] {sim.saup_metrics['saup_score']:.4f}")
+        console.print(f"[bold]VAUP Score:[/bold] {sim.saup_metrics['saup_score']:.4f}")
         console.print(f"[bold]Ground Truth:[/bold] {'✅ Pass' if sim.ground_truth_pass else '❌ Fail' if sim.ground_truth_pass is not None else 'N/A'}")
     console.print()
 
-    # Calculate weights for display
-    weights = []
+    # Calculate penalties for display
+    penalties = []
     if sim.saup_metrics:
         config = SAUPConfig()
         for score in sim.uncertainty_scores:
             from tau2.metrics.uncertainty import calculate_situational_weight
-            w = calculate_situational_weight(
+            penalty = calculate_situational_weight(
                 score.da_score,
                 score.do_score if score.do_type == "agent_coherence" else None,
                 score.do_score if score.do_type == "user_coherence" else None,
                 config
             )
-            weights.append(w)
+            penalties.append(penalty)
 
     # Create table
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("Turn", style="dim", width=5)
     table.add_column("Actor", width=8)
     table.add_column("U_i", justify="right", width=8)
-    table.add_column("Da", justify="right", width=8)
+    table.add_column("Stagnate", justify="right", width=8)
     table.add_column("Do", justify="right", width=8)
-    table.add_column("W_i", justify="right", width=8)
+    table.add_column("Penalty", justify="right", width=8)
     table.add_column("Do Type", width=10)
     table.add_column("Content", width=35)
 
@@ -836,12 +902,13 @@ def print_detailed_trajectory(
         else:
             ui_color = "red"
         
-        # Color code Da (inquiry drift)
+        # Color code Stagnation (da_score now stores stagnation)
         da_str = "—"
         if score.da_score is not None:
+            # Low stagnation is good (green), high is bad (red)
             if score.da_score < 0.3:
                 da_color = "green"
-            elif score.da_score < 0.6:
+            elif score.da_score < 0.7:
                 da_color = "yellow"
             else:
                 da_color = "red"
@@ -858,17 +925,17 @@ def print_detailed_trajectory(
                 do_color = "red"
             do_str = f"[{do_color}]{score.do_score:.3f}[/{do_color}]"
         
-        # Display weight if available
-        w_str = "—"
-        if weights and idx < len(weights):
-            w = weights[idx]
-            if w < 0.3:
-                w_color = "green"
-            elif w < 0.6:
-                w_color = "yellow"
+        # Display penalty if available
+        penalty_str = "—"
+        if penalties and idx < len(penalties):
+            penalty = penalties[idx]
+            if penalty < 0.3:
+                penalty_color = "green"
+            elif penalty < 0.6:
+                penalty_color = "yellow"
             else:
-                w_color = "red"
-            w_str = f"[{w_color}]{w:.3f}[/{w_color}]"
+                penalty_color = "red"
+            penalty_str = f"[{penalty_color}]{penalty:.3f}[/{penalty_color}]"
         
         do_type_str = score.do_type[:10] if score.do_type else "—"
 
@@ -878,7 +945,7 @@ def print_detailed_trajectory(
             f"[{ui_color}]{score.ui_score:.3f}[/{ui_color}]",
             da_str,
             do_str,
-            w_str,
+            penalty_str,
             do_type_str,
             score.content_preview[:35] + "...",
         )
@@ -956,10 +1023,15 @@ def main():
         )
         results = Results.load(sim_path)
 
+        # Parse SAUP configuration from CLI arguments
+        saup_config = SAUPConfig(**args.saup_config)
+        console.print(f"[cyan]⚙️  SAUP Config: α={saup_config.alpha}, β={saup_config.beta}, γ={saup_config.gamma}[/cyan]")
+
         # Analyze
         console.print("[cyan]🔄 Analyzing trajectories and calculating uncertainty scores...[/cyan]")
         analysis = analyze_results(
             results,
+            config=saup_config,
             verbose=args.verbose,
             calculate_auroc=not args.no_auroc
         )
