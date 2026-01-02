@@ -567,52 +567,42 @@ def calculate_jaccard_similarity(text_a: str, text_b: str) -> float:
     return jaccard_sim
 
 
-def calculate_information_stagnation(
-    current_text: str,
-    global_token_set: set[str],
-    history_texts: list[str]
-) -> float:
+def calculate_hybrid_repetition_score(current_text: str, history_texts: list[str]) -> float:
     """
-    Calculate Information Stagnation score - measures lack of information gain velocity.
+    Calculate Hybrid Repetition score - combines semantic and lexical similarity.
     
-    This metric implements a **Novelty Gate** that distinguishes template reuse from
-    true stagnation. The agent is NOT penalized for using standard phrasing if it
-    introduces new high-value entities (flights, IDs, names, etc.).
+    This metric solves the "Enumeration vs. Looping" problem:
+    - **Looping:** High semantic + high lexical → High penalty (stuck repeating)
+    - **Enumeration:** High semantic + low lexical → Low penalty (valid iteration)
     
     Formula:
-        1. Calculate Novelty Ratio: R_novel = |NewTokens| / |AllCurrentTokens|
-        2. Hard Gate: If R_novel > 0.15, return 0.0 (Progress detected)
-        3. Soft Penalty: If R_novel <= 0.15, calculate:
-           stagnation = max(CosineSim_i × (1 - R_novel)) for recent history
+        Hybrid = max(CosineSim_i × JaccardSim_i) for last 3 turns
     
-    The gate ensures that enumeration (same template, different entities) scores
-    near-zero stagnation, while true looping (same template, same entities) scores high.
+    The multiplication acts as a "soft AND" gate: both semantic intent AND
+    specific tokens must match for a high repetition score.
     
     Args:
         current_text: Current agent response text
-        global_token_set: Set of all unique content tokens seen in the trajectory so far
-        history_texts: List of previous agent response texts (for semantic similarity)
+        history_texts: List of previous agent response texts
                        
     Returns:
-        float: Information stagnation score in range [0, 1] where:
-               - 0.0 = novel information introduced (R_novel > 15%)
-               - ~0.5 = moderate stagnation (some novelty, high semantic similarity)
-               - >0.8 = true stagnation (no new info, repetitive intent)
+        float: Hybrid repetition score in range [0, 1] where:
+               - 0.0 = novel response (different intent OR different entities)
+               - ~0.5 = partial repetition
+               - >0.8 = true looping (same intent AND same entities)
                Returns 0.0 if history is empty or embeddings unavailable
     
-    Example (Enumeration - Low Penalty):
-        >>> global_set = {"flight", "cancelled", "a123", "b456"}
-        >>> history = ["Flight A123 cancelled", "Flight B456 cancelled"]
-        >>> current = "Flight C789 cancelled"  # New entity: C789
-        >>> score = calculate_information_stagnation(current, global_set, history)
-        >>> # Returns ~0.0 (R_novel = 1/3 = 33% > 15%)
-    
     Example (Looping - High Penalty):
-        >>> global_set = {"help", "assist", "today"}
         >>> history = ["I can help with that", "Let me assist you"]
-        >>> current = "I can help with that"  # Exact repeat, no new tokens
-        >>> score = calculate_information_stagnation(current, global_set, history)
-        >>> # Returns ~0.95 (R_novel = 0%, high cosine similarity)
+        >>> current = "I can help with that"  # Exact repeat
+        >>> score = calculate_hybrid_repetition_score(current, history)
+        >>> # Returns ~1.0 (high cosine × high jaccard)
+    
+    Example (Enumeration - Low Penalty):
+        >>> history = ["Flight A123 cancelled", "Flight B456 cancelled"]
+        >>> current = "Flight C789 cancelled"  # Different entity
+        >>> score = calculate_hybrid_repetition_score(current, history)
+        >>> # Returns ~0.3 (high cosine × low jaccard)
     """
     # Handle edge cases
     if not current_text or not current_text.strip():
@@ -621,58 +611,27 @@ def calculate_information_stagnation(
     if not history_texts:
         return 0.0
     
-    # Extract and filter current tokens
-    current_tokens_raw = current_text.lower().split()
-    current_tokens = set()
-    
-    def clean_token(token: str) -> str:
-        """Remove leading/trailing punctuation from token."""
-        return token.strip('.,!?;:()[]{}"\'-')
-    
-    for token in current_tokens_raw:
-        cleaned = clean_token(token)
-        # Skip if empty, stop word, or purely numeric
-        if not cleaned or cleaned in STOP_WORDS:
-            continue
-        if cleaned.replace('.', '').replace('-', '').isdigit():
-            continue
-        current_tokens.add(cleaned)
-    
-    # Handle case where all tokens were filtered
-    if not current_tokens:
-        return 0.0
-    
-    # Calculate Novelty Ratio: fraction of tokens that are NEW to the global set
-    new_tokens = current_tokens - global_token_set
-    R_novel = len(new_tokens) / len(current_tokens)
-    
-    logger.debug(
-        f"Novelty check: {len(new_tokens)}/{len(current_tokens)} new tokens "
-        f"(R_novel={R_novel:.3f})"
-    )
-    
-    # THE HARD GATE: If novelty exceeds 15%, this is progress (enumeration)
-    if R_novel > 0.15:
-        logger.debug(f"Novelty gate triggered (R_novel={R_novel:.3f} > 0.15). No penalty.")
-        return 0.0
-    
-    # THE SOFT PENALTY: Low novelty detected, check semantic similarity
     # Get embedding service for semantic similarity
     service = EmbeddingService()
     if not service.is_available():
-        logger.debug("Embedding service not available, using novelty-only penalty")
-        # Fallback: pure novelty-based penalty
-        return float(1.0 - R_novel)
+        logger.debug("Embedding service not available, falling back to Jaccard only")
+        # Fallback: use Jaccard similarity only
+        max_jaccard = 0.0
+        recent_history = history_texts[-3:] if len(history_texts) > 3 else history_texts
+        for past_text in recent_history:
+            jaccard = calculate_jaccard_similarity(current_text, past_text)
+            max_jaccard = max(max_jaccard, jaccard)
+        return max_jaccard
     
     # Get embedding for current text
     current_embedding = service.get_embedding(current_text)
     if current_embedding is None:
-        return float(1.0 - R_novel)
+        return 0.0
     
-    # Look at last 3 turns (local window for stagnation detection)
+    # Look at last 3 turns (local window for loop detection)
     recent_history = history_texts[-3:] if len(history_texts) > 3 else history_texts
     
-    max_stagnation_score = 0.0
+    max_hybrid_score = 0.0
     
     for past_text in recent_history:
         if not past_text or not past_text.strip():
@@ -694,22 +653,25 @@ def calculate_information_stagnation(
             cosine_sim = np.dot(current_embedding, past_embedding) / (norm_current * norm_past)
             cosine_sim = max(0.0, min(1.0, float(cosine_sim)))
             
-            # Stagnation formula: Semantic similarity × (lack of novelty)
-            # This penalizes "same intent + no new info"
-            stagnation = cosine_sim * (1.0 - R_novel)
+            # Calculate lexical similarity (Jaccard)
+            jaccard_sim = calculate_jaccard_similarity(current_text, past_text)
             
-            # Track maximum (worst-case stagnation)
-            max_stagnation_score = max(max_stagnation_score, stagnation)
+            # Hybrid score: soft AND gate
+            # Both intent AND tokens must match for high score
+            hybrid_score = cosine_sim * jaccard_sim
+            
+            # Track maximum (worst-case repetition)
+            max_hybrid_score = max(max_hybrid_score, hybrid_score)
             
             logger.debug(
-                f"Stagnation check: cosine={cosine_sim:.3f}, R_novel={R_novel:.3f}, "
-                f"stagnation={stagnation:.3f}"
+                f"Repetition check: cosine={cosine_sim:.3f}, jaccard={jaccard_sim:.3f}, "
+                f"hybrid={hybrid_score:.3f}"
             )
         except Exception as e:
-            logger.error(f"Error calculating information stagnation: {e}")
+            logger.error(f"Error calculating hybrid repetition: {e}")
             continue
     
-    return max_stagnation_score
+    return max_hybrid_score
 
 
 def calculate_tool_repetition(
@@ -981,50 +943,44 @@ def calculate_saup_score(
     config: Optional[SAUPConfig] = None
 ) -> dict:
     """
-    Calculate VAUP (Velocity-Aware Uncertainty Propagation) aggregation score.
+    Calculate SAUP-D aggregation score for a trajectory using additive RMS.
     
-    Implements the VAUP formula with **Logistic Temporal Weighting** to focus
-    analysis on the "Critical Action Phase" (middle 40%-90% of trajectory):
-    
-        U_trajectory = sqrt( (sum(w_i * (U_i + Penalty_i)^2)) / sum(w_i) )
+    Implements the additive SAUP-D formula to avoid signal vanishing:
+        U_trajectory = sqrt( (1/N) * sum((U_i + Penalty_i)^2) )
     
     Where:
-        - w_i = sigmoid(12 * (t_i - 0.7)) with t_i = i/N (normalized turn index)
+        - N = number of steps
         - U_i = normalized entropy for step i
         - Penalty_i = α·Da_i + β·Do_agent_i + γ·Do_user_i
     
-    The logistic weighting creates an S-curve that:
-    - De-emphasizes early turns (setup phase, low risk)
-    - Emphasizes middle turns 40%-90% (critical decision phase)
-    - De-emphasizes late turns (cleanup phase, outcome already determined)
+    This additive formulation ensures that high drift/coherence gaps contribute
+    to risk even when the agent is confidently wrong (low U_i).
     
     Args:
         step_data: List of step dictionaries containing:
                    - 'ui': normalized entropy (required)
-                   - 'da': information stagnation (optional)
+                   - 'da': inquiry drift (optional)
                    - 'do_agent': agent coherence (optional)
                    - 'do_user': user coherence (optional)
         config: SAUP configuration (defaults to SAUPConfig())
         
     Returns:
         dict: {
-            'saup_score': float - final trajectory score (VAUP),
+            'saup_score': float - final trajectory score,
             'num_steps': int - number of steps included,
             'mean_penalty': float - average penalty across steps,
             'std_penalty': float - std deviation of penalties,
             'mean_ui': float - average U_i across steps,
-            'mean_weight': float - average temporal weight,
-            'penalties': list[float] - Penalty_i for each step (for debugging),
-            'weights': list[float] - w_i for each step (for debugging)
+            'penalties': list[float] - Penalty_i for each step (for debugging)
         }
     
     Example:
         >>> steps = [
-        ...     {'ui': 0.1, 'da': 0.02, 'do_agent': 0.3, 'do_user': None},
-        ...     {'ui': 0.15, 'da': 0.05, 'do_agent': None, 'do_user': 0.35}
+        ...     {'ui': 0.1, 'da': 0.2, 'do_agent': 0.3, 'do_user': None},
+        ...     {'ui': 0.15, 'da': 0.25, 'do_agent': None, 'do_user': 0.35}
         ... ]
         >>> result = calculate_saup_score(steps)
-        >>> print(f"VAUP Score: {result['saup_score']:.4f}")
+        >>> print(f"SAUP Score: {result['saup_score']:.4f}")
     """
     if config is None:
         config = SAUPConfig()
@@ -1036,20 +992,15 @@ def calculate_saup_score(
             'mean_penalty': 0.0,
             'std_penalty': 0.0,
             'mean_ui': 0.0,
-            'mean_weight': 0.0,
-            'penalties': [],
-            'weights': []
+            'penalties': []
         }
     
     # Calculate penalties and risk scores using additive formula
     penalties = []
     step_risks = []
     ui_values = []
-    weights = []
     
-    N = len(step_data)
-    
-    for idx, step in enumerate(step_data):
+    for step in step_data:
         # Extract metrics
         ui = step.get('ui', 0.0)
         da = step.get('da')
@@ -1061,7 +1012,7 @@ def calculate_saup_score(
         do_agent_val = do_agent if do_agent is not None else 0.0
         do_user_val = do_user if do_user is not None else 0.0
         
-        # Calculate standalone penalty term (additive contribution from stagnation/coherence)
+        # Calculate standalone penalty term (additive contribution from drift/coherence)
         penalty = (
             config.alpha * da_val +
             config.beta * do_agent_val +
@@ -1072,42 +1023,14 @@ def calculate_saup_score(
         # This prevents signal vanishing when ui ≈ 0
         step_risk = ui + penalty
         
-        # Calculate Logistic Temporal Weight
-        # w_i = sigmoid(k * (t_i - c))
-        # where t_i = i/N (normalized turn index in [0, 1])
-        #       c = 0.7 (center of S-curve at 70% of trajectory)
-        #       k = 12 (steepness of the curve)
-        t_i = float(idx) / float(N) if N > 0 else 0.0
-        k = 12.0
-        c = 0.7
-        
-        # Sigmoid function: 1 / (1 + exp(-k*(t_i - c)))
-        z = k * (t_i - c)
-        # Numerically stable sigmoid
-        if z >= 0:
-            w_i = 1.0 / (1.0 + np.exp(-z))
-        else:
-            exp_z = np.exp(z)
-            w_i = exp_z / (1.0 + exp_z)
-        
         penalties.append(penalty)
         step_risks.append(step_risk)
         ui_values.append(ui)
-        weights.append(w_i)
     
-    # Calculate VAUP score using weighted RMS
-    sum_weights = sum(weights)
-    
-    # Robustness: avoid division by zero
-    if sum_weights == 0 or sum_weights < 1e-8:
-        # Fallback to uniform weighting if all weights are near-zero
-        logger.warning("Sum of weights near zero, falling back to uniform weighting")
-        saup_score = np.sqrt(sum(risk ** 2 for risk in step_risks) / N)
-        mean_weight = 0.0
-    else:
-        sum_weighted_squared_risks = sum(w * (risk ** 2) for w, risk in zip(weights, step_risks))
-        saup_score = np.sqrt(sum_weighted_squared_risks / sum_weights)
-        mean_weight = float(np.mean(weights))
+    # Calculate SAUP score using RMS of step risks
+    N = len(step_data)
+    sum_squared_risks = sum(risk ** 2 for risk in step_risks)
+    saup_score = np.sqrt(sum_squared_risks / N)
     
     # Calculate statistics
     result = {
@@ -1116,9 +1039,7 @@ def calculate_saup_score(
         'mean_penalty': float(np.mean(penalties)) if penalties else 0.0,
         'std_penalty': float(np.std(penalties)) if penalties else 0.0,
         'mean_ui': float(np.mean(ui_values)) if ui_values else 0.0,
-        'mean_weight': mean_weight,
-        'penalties': penalties,
-        'weights': weights
+        'penalties': penalties
     }
     
     return result

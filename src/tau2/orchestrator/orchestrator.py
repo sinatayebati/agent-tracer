@@ -25,7 +25,7 @@ from tau2.metrics.uncertainty import (
     EmbeddingService,
     SAUPConfig,
     calculate_inference_gap,
-    calculate_information_stagnation,
+    calculate_hybrid_repetition_score,
     calculate_tool_repetition,
     calculate_saup_from_trajectory,
     get_uncertainty_stats,
@@ -89,13 +89,11 @@ class Orchestrator:
         # SAUP configuration
         self.saup_config = saup_config if saup_config is not None else SAUPConfig()
         
-        # VAUP (Velocity-Aware Uncertainty Propagation) state tracking
+        # Situational awareness tracking (reuses calculate_uncertainty flag)
         self.calculate_situational_awareness = calculate_uncertainty
         self.conversation_history: list[str] = []
-        self.agent_history: list[str] = []  # Track agent text responses for stagnation detection
+        self.agent_history: list[str] = []  # Track agent text responses for repetition detection
         self.agent_tool_history: list[list] = []  # Track agent tool calls for duplicate detection
-        self.global_token_set: set[str] = set()  # Track all unique content tokens (for novelty gate)
-        self.last_do_score: Optional[float] = None  # Track previous inference gap (for momentum)
         self.initial_instruction: Optional[str] = None
         self.last_agent_message: Optional[str] = None
         
@@ -373,42 +371,6 @@ class Orchestrator:
         
         return ""
     
-    def _extract_content_tokens(self, text: str) -> set[str]:
-        """
-        Extract content-bearing tokens from text for novelty tracking.
-        
-        Filters out stop words, punctuation, and numeric tokens to focus on
-        high-value entities (names, IDs, actions, domain-specific terms).
-        
-        Args:
-            text: Text to extract tokens from
-            
-        Returns:
-            set[str]: Set of cleaned content tokens
-        """
-        from tau2.metrics.uncertainty import STOP_WORDS
-        
-        if not text or not text.strip():
-            return set()
-        
-        tokens_raw = text.lower().split()
-        tokens = set()
-        
-        def clean_token(token: str) -> str:
-            """Remove leading/trailing punctuation from token."""
-            return token.strip('.,!?;:()[]{}"\'-')
-        
-        for token in tokens_raw:
-            cleaned = clean_token(token)
-            # Skip if empty, stop word, or purely numeric
-            if not cleaned or cleaned in STOP_WORDS:
-                continue
-            if cleaned.replace('.', '').replace('-', '').isdigit():
-                continue
-            tokens.add(cleaned)
-        
-        return tokens
-    
     def _calculate_and_attach_metrics(
         self, message: Message
     ) -> None:
@@ -417,7 +379,7 @@ class Orchestrator:
         
         Calculates:
         - Uncertainty statistics (U_i): normalized entropy from logprobs
-        - Information Stagnation (Da): novelty-gated stagnation score for agent messages
+        - Hybrid Repetition (Da): combines semantic + lexical similarity for agent messages
         - Tool Repetition: exact duplicate tool call detection
         - Inference Gap (Do): semantic distance between action and observation
         
@@ -444,27 +406,22 @@ class Orchestrator:
         
         # Calculate semantic distance metrics if situational awareness enabled
         if self.calculate_situational_awareness and self.embedding_service:
-            # Calculate Da (Information Stagnation) for AGENT messages only
-            # Uses novelty gate to distinguish enumeration from true looping
+            # Calculate Da (Hybrid Repetition) for AGENT messages only
+            # Combines semantic similarity with lexical overlap to distinguish looping from enumeration
             if isinstance(message, AssistantMessage):
                 try:
                     # Get current message content
                     current_text = self._format_message_for_history(message)
                     
-                    # Calculate text-based information stagnation
-                    text_stagnation = 0.0
+                    # Calculate text-based hybrid repetition
+                    text_repetition = 0.0
                     if current_text:
-                        text_stagnation = calculate_information_stagnation(
+                        text_repetition = calculate_hybrid_repetition_score(
                             current_text,
-                            self.global_token_set,
                             self.agent_history
                         )
                         # Update agent history for next iteration
                         self.agent_history.append(current_text)
-                        
-                        # Update global token set with new tokens from this message
-                        new_tokens = self._extract_content_tokens(current_text)
-                        self.global_token_set.update(new_tokens)
                     
                     # Calculate tool-based repetition
                     tool_repetition = 0.0
@@ -477,16 +434,16 @@ class Orchestrator:
                         self.agent_tool_history.append(message.tool_calls)
                     
                     # Aggregate: max (worst-case penalty)
-                    # Either text stagnation OR tool duplication is a failure signal
-                    da_score = max(text_stagnation, tool_repetition)
+                    # Either text looping OR tool duplication is a failure signal
+                    da_score = max(text_repetition, tool_repetition)
                     message.da_score = da_score
                     
                     logger.debug(
-                        f"Calculated Da for agent: text_stag={text_stagnation:.4f}, "
+                        f"Calculated Da for agent: text_rep={text_repetition:.4f}, "
                         f"tool_rep={tool_repetition:.4f}, final={da_score:.4f}"
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to calculate stagnation score: {e}")
+                    logger.warning(f"Failed to calculate repetition score: {e}")
                     message.da_score = None
 
     def step(self):
@@ -516,9 +473,6 @@ class Orchestrator:
                 msg_text = self._format_message_for_history(user_msg)
                 if msg_text:
                     self.conversation_history.append(msg_text)
-                    # Update global token set with user message tokens
-                    user_tokens = self._extract_content_tokens(msg_text)
-                    self.global_token_set.update(user_tokens)
             
             # Calculate metrics (uncertainty + semantic distance)
             self._calculate_and_attach_metrics(user_msg)
@@ -529,38 +483,13 @@ class Orchestrator:
                 try:
                     user_response = self._format_message_for_history(user_msg)
                     if user_response:
-                        do_score_raw = calculate_inference_gap(
+                        do_score = calculate_inference_gap(
                             self.last_agent_message,
                             user_response
                         )
-                        
-                        # COHERENCE MOMENTUM: Adjust Do based on velocity
-                        do_score_adjusted = do_score_raw
-                        
-                        if self.last_do_score is not None:
-                            velocity = do_score_raw - self.last_do_score
-                            
-                            if velocity < 0:
-                                # Gap is decreasing → Coherence improving → Reward
-                                do_score_adjusted = do_score_raw * 0.5
-                                logger.debug(
-                                    f"User coherence momentum: IMPROVING (Δ={velocity:.4f}), "
-                                    f"raw={do_score_raw:.4f} → adjusted={do_score_adjusted:.4f}"
-                                )
-                            elif velocity > 0:
-                                # Gap is increasing → Coherence degrading → Penalize
-                                do_score_adjusted = do_score_raw * 1.5
-                                logger.debug(
-                                    f"User coherence momentum: DEGRADING (Δ={velocity:.4f}), "
-                                    f"raw={do_score_raw:.4f} → adjusted={do_score_adjusted:.4f}"
-                                )
-                        
-                        # Update last Do score (use raw value for next velocity calculation)
-                        self.last_do_score = do_score_raw
-                        
-                        user_msg.do_score = do_score_adjusted
+                        user_msg.do_score = do_score
                         user_msg.do_type = "user_coherence"
-                        logger.debug(f"Calculated Do (user coherence): {do_score_adjusted:.4f}")
+                        logger.debug(f"Calculated Do (user coherence): {do_score:.4f}")
                 except Exception as e:
                     logger.warning(f"Failed to calculate Do for user: {e}")
             
@@ -590,7 +519,6 @@ class Orchestrator:
                     self.conversation_history.append(msg_text)
                     # Store last agent message for user coherence calculation
                     self.last_agent_message = msg_text
-                    # Note: Agent message tokens are already added in _calculate_and_attach_metrics
             
             # Calculate metrics (uncertainty + semantic distance)
             self._calculate_and_attach_metrics(agent_msg)
@@ -631,52 +559,23 @@ class Orchestrator:
                         obs = self._format_message_for_history(tool_msg)
                         if obs:
                             tool_observations.append(obs)
-                            # Update global token set with observation tokens
-                            obs_tokens = self._extract_content_tokens(obs)
-                            self.global_token_set.update(obs_tokens)
                     
                     if tool_observations:
                         combined_observation = " | ".join(tool_observations)
-                        do_score_raw = calculate_inference_gap(
+                        do_score = calculate_inference_gap(
                             tool_call_text,
                             combined_observation
                         )
                         
-                        # COHERENCE MOMENTUM: Adjust Do based on velocity
-                        # If coherence is improving (gap decreasing), reward with 0.5x multiplier
-                        # If coherence is degrading (gap increasing), penalize with 1.5x multiplier
-                        do_score_adjusted = do_score_raw
-                        
-                        if self.last_do_score is not None:
-                            velocity = do_score_raw - self.last_do_score
-                            
-                            if velocity < 0:
-                                # Gap is decreasing → Agent is "zeroing in" → Reward
-                                do_score_adjusted = do_score_raw * 0.5
-                                logger.debug(
-                                    f"Coherence momentum: IMPROVING (Δ={velocity:.4f}), "
-                                    f"raw={do_score_raw:.4f} → adjusted={do_score_adjusted:.4f}"
-                                )
-                            elif velocity > 0:
-                                # Gap is increasing → Agent is drifting → Penalize
-                                do_score_adjusted = do_score_raw * 1.5
-                                logger.debug(
-                                    f"Coherence momentum: DEGRADING (Δ={velocity:.4f}), "
-                                    f"raw={do_score_raw:.4f} → adjusted={do_score_adjusted:.4f}"
-                                )
-                        
-                        # Update last Do score (use raw value for next velocity calculation)
-                        self.last_do_score = do_score_raw
-                        
-                        # Attach adjusted Do score to the requesting message (agent or user)
+                        # Attach Do score to the requesting message (agent or user)
                         if self.from_role == Role.AGENT:
-                            tool_call_msg.do_score = do_score_adjusted
+                            tool_call_msg.do_score = do_score
                             tool_call_msg.do_type = "agent_coherence"
-                            logger.debug(f"Calculated Do (agent coherence): {do_score_adjusted:.4f}")
+                            logger.debug(f"Calculated Do (agent coherence): {do_score:.4f}")
                         elif self.from_role == Role.USER:
-                            tool_call_msg.do_score = do_score_adjusted
+                            tool_call_msg.do_score = do_score
                             tool_call_msg.do_type = "user_coherence"
-                            logger.debug(f"Calculated Do (user tool coherence): {do_score_adjusted:.4f}")
+                            logger.debug(f"Calculated Do (user tool coherence): {do_score:.4f}")
                         
                         # Add tool observation to history
                         self.conversation_history.append(combined_observation)
