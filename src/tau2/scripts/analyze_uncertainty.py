@@ -112,19 +112,33 @@ class UncertaintyAnalysis(BaseModel):
     auroc_metrics: Optional[AUROCMetrics] = None
 
 
-def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUncertainty:
+def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = False) -> SimulationUncertainty:
     """
     Analyze a single simulation and extract uncertainty scores.
 
+    This function recalculates repetition metrics using the Hybrid Repetition approach
+    (combining semantic and lexical similarity) to distinguish enumeration from looping.
+    It also applies strict tool repetition penalties for exact duplicate tool calls.
+
     Args:
         simulation: A simulation run dictionary
+        config: SAUP configuration for weighted aggregation
         verbose: If True, include detailed statistics
 
     Returns:
         SimulationUncertainty: Analyzed uncertainty data
     """
+    from tau2.metrics.uncertainty import (
+        calculate_hybrid_repetition_score,
+        calculate_tool_repetition
+    )
+    
     uncertainty_scores = []
     turn_counter = 0
+    
+    # Track agent history for repetition detection
+    agent_text_history = []  # Text responses for hybrid repetition
+    agent_tool_history = []  # Tool calls for exact duplicate detection
 
     for message in simulation.get("messages", []):
         role = message.get("role")
@@ -142,8 +156,45 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
         logprobs = message.get("logprobs")
         ui_score = calculate_normalized_entropy(logprobs)
         
-        # Extract semantic distance metrics
-        da_score = message.get("da_score")
+        # Calculate HYBRID REPETITION for agent messages
+        da_score = None
+        if role == "assistant":
+            # Extract content
+            content = message.get("content", "")
+            if content is None:
+                content = ""
+            
+            # Calculate text-based hybrid repetition
+            text_repetition = 0.0
+            if content:
+                text_repetition = calculate_hybrid_repetition_score(
+                    content, 
+                    agent_text_history
+                )
+                # Update text history
+                agent_text_history.append(content)
+            
+            # Calculate tool-based repetition
+            tool_repetition = 0.0
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                tool_repetition = calculate_tool_repetition(
+                    tool_calls,
+                    agent_tool_history
+                )
+                # Update tool history
+                agent_tool_history.append(tool_calls)
+            
+            # Aggregate: take maximum (worst-case penalty)
+            # Either text looping OR tool duplication is a failure signal
+            da_score = max(text_repetition, tool_repetition)
+            
+            logger.debug(
+                f"Turn {turn_counter}: text_rep={text_repetition:.3f}, "
+                f"tool_rep={tool_repetition:.3f}, final_da={da_score:.3f}"
+            )
+        
+        # Extract inference gap (Do) metrics from pre-computed data
         do_score = message.get("do_score")
         do_type = message.get("do_type")
 
@@ -158,7 +209,7 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
                 if message.get("content")
                 else "[tool_call]"
             ),
-            da_score=da_score,
+            da_score=da_score,  # Hybrid Repetition (text + tool)
             do_score=do_score,
             do_type=do_type,
         )
@@ -170,21 +221,21 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
 
         uncertainty_scores.append(turn_data)
 
-    # Calculate SAUP-D aggregation score
+    # Calculate SAUP-D aggregation score (using ADDITIVE formula)
     saup_metrics = None
     if uncertainty_scores:
         step_data = [
             {
                 "ui": turn.ui_score,
-                "da": turn.da_score,
+                "da": turn.da_score,  # Hybrid repetition score
                 "do_agent": turn.do_score if turn.do_type == "agent_coherence" else None,
                 "do_user": turn.do_score if turn.do_type == "user_coherence" else None
             }
             for turn in uncertainty_scores
         ]
-        saup_result = calculate_saup_score(step_data, SAUPConfig())
-        # Remove weights list (too verbose)
-        saup_metrics = {k: v for k, v in saup_result.items() if k != 'weights'}
+        saup_result = calculate_saup_score(step_data, config)
+        # Remove penalties list (too verbose)
+        saup_metrics = {k: v for k, v in saup_result.items() if k != 'penalties'}
     
     # Extract ground truth (task success)
     ground_truth = simulation.get("reward_info", {}).get("reward", None) if simulation.get("reward_info") else None
@@ -196,8 +247,8 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
         agent_scores = [s.ui_score for s in uncertainty_scores if s.actor == "agent"]
         user_scores = [s.ui_score for s in uncertainty_scores if s.actor == "user"]
         
-        # Semantic distance metrics
-        da_scores = [s.da_score for s in uncertainty_scores if s.da_score is not None]
+        # Repetition and coherence metrics
+        repetition_scores = [s.da_score for s in uncertainty_scores if s.da_score is not None]
         do_scores = [s.do_score for s in uncertainty_scores if s.do_score is not None]
         do_agent_coherence = [s.do_score for s in uncertainty_scores if s.do_score is not None and s.do_type == "agent_coherence"]
         do_user_coherence = [s.do_score for s in uncertainty_scores if s.do_score is not None and s.do_type == "user_coherence"]
@@ -213,14 +264,14 @@ def analyze_simulation(simulation: dict, verbose: bool = False) -> SimulationUnc
             ),
             "agent_turn_count": len(agent_scores),
             "user_turn_count": len(user_scores),
-            # Semantic distance metrics
-            "mean_da_score": float(np.mean(da_scores)) if da_scores else None,
-            "std_da_score": float(np.std(da_scores)) if da_scores else None,
+            # Hybrid repetition metrics
+            "mean_repetition_score": float(np.mean(repetition_scores)) if repetition_scores else None,
+            "std_repetition_score": float(np.std(repetition_scores)) if repetition_scores else None,
             "mean_do_score": float(np.mean(do_scores)) if do_scores else None,
             "std_do_score": float(np.std(do_scores)) if do_scores else None,
             "mean_do_agent_coherence": float(np.mean(do_agent_coherence)) if do_agent_coherence else None,
             "mean_do_user_coherence": float(np.mean(do_user_coherence)) if do_user_coherence else None,
-            "da_count": len(da_scores),
+            "repetition_count": len(repetition_scores),
             "do_count": len(do_scores),
         }
 
@@ -332,12 +383,13 @@ def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optio
         return None
 
 
-def analyze_results(results: Results, verbose: bool = False, calculate_auroc: bool = True) -> UncertaintyAnalysis:
+def analyze_results(results: Results, config: SAUPConfig, verbose: bool = False, calculate_auroc: bool = True) -> UncertaintyAnalysis:
     """
     Analyze all simulations in the results.
 
     Args:
         results: Tau-2 simulation results
+        config: SAUP configuration for weighted aggregation
         verbose: If True, include detailed statistics
         calculate_auroc: If True, calculate AUROC metrics for failure prediction
 
@@ -348,7 +400,7 @@ def analyze_results(results: Results, verbose: bool = False, calculate_auroc: bo
 
     for simulation in results.simulations:
         sim_dict = simulation.model_dump()
-        analyzed = analyze_simulation(sim_dict, verbose=verbose)
+        analyzed = analyze_simulation(sim_dict, config, verbose=verbose)
         analyzed_sims.append(analyzed)
 
     # Create metadata
@@ -461,15 +513,16 @@ def print_uncertainty_summary_from_results(
     
     # Semantic distance metrics
     if all_da_scores or all_do_scores:
-        console.print("\n[bold cyan]Semantic Distance Metrics[/bold cyan]")
+        console.print("\n[bold cyan]Situational Awareness Metrics[/bold cyan]")
         
         if all_da_scores:
-            console.print("\n[bold]Inquiry Drift (Da):[/bold]")
+            console.print("\n[bold]Local Repetition (Looping Penalty):[/bold]")
             console.print(f"  Mean: {np.mean(all_da_scores):.4f}")
             console.print(f"  Std:  {np.std(all_da_scores):.4f}")
             console.print(f"  Min:  {np.min(all_da_scores):.4f}")
             console.print(f"  Max:  {np.max(all_da_scores):.4f}")
             console.print(f"  Total measurements: {len(all_da_scores)}")
+            console.print(f"  [dim]Note: High values indicate agent is repeating itself (stuck in loops)[/dim]")
         
         if all_do_scores:
             console.print("\n[bold]Inference Gap (Do):[/bold]")
@@ -632,15 +685,16 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                     all_do_user.append(score.do_score)
     
     if all_da_scores or all_do_scores:
-        console.print("\n[bold cyan]Semantic Distance Metrics[/bold cyan]")
+        console.print("\n[bold cyan]Situational Awareness Metrics[/bold cyan]")
         
         if all_da_scores:
-            console.print("\n[bold]Inquiry Drift (Da):[/bold]")
+            console.print("\n[bold]Local Repetition (Looping Penalty):[/bold]")
             console.print(f"  Mean: {np.mean(all_da_scores):.4f}")
             console.print(f"  Std:  {np.std(all_da_scores):.4f}")
             console.print(f"  Min:  {np.min(all_da_scores):.4f}")
             console.print(f"  Max:  {np.max(all_da_scores):.4f}")
             console.print(f"  Count: {len(all_da_scores)}")
+            console.print(f"  [dim]High values indicate repetitive/looping behavior[/dim]")
         
         if all_do_scores:
             console.print("\n[bold]Inference Gap (Do):[/bold]")
@@ -802,28 +856,28 @@ def print_detailed_trajectory(
         console.print(f"[bold]Ground Truth:[/bold] {'✅ Pass' if sim.ground_truth_pass else '❌ Fail' if sim.ground_truth_pass is not None else 'N/A'}")
     console.print()
 
-    # Calculate weights for display
-    weights = []
+    # Calculate penalties for display
+    penalties = []
     if sim.saup_metrics:
         config = SAUPConfig()
         for score in sim.uncertainty_scores:
             from tau2.metrics.uncertainty import calculate_situational_weight
-            w = calculate_situational_weight(
+            penalty = calculate_situational_weight(
                 score.da_score,
                 score.do_score if score.do_type == "agent_coherence" else None,
                 score.do_score if score.do_type == "user_coherence" else None,
                 config
             )
-            weights.append(w)
+            penalties.append(penalty)
 
     # Create table
     table = Table(show_header=True, header_style="bold cyan")
     table.add_column("Turn", style="dim", width=5)
     table.add_column("Actor", width=8)
     table.add_column("U_i", justify="right", width=8)
-    table.add_column("Da", justify="right", width=8)
+    table.add_column("Repeat", justify="right", width=8)
     table.add_column("Do", justify="right", width=8)
-    table.add_column("W_i", justify="right", width=8)
+    table.add_column("Penalty", justify="right", width=8)
     table.add_column("Do Type", width=10)
     table.add_column("Content", width=35)
 
@@ -836,12 +890,13 @@ def print_detailed_trajectory(
         else:
             ui_color = "red"
         
-        # Color code Da (inquiry drift)
+        # Color code Repetition (da_score now stores repetition)
         da_str = "—"
         if score.da_score is not None:
+            # High repetition is bad (red), low is good (green)
             if score.da_score < 0.3:
                 da_color = "green"
-            elif score.da_score < 0.6:
+            elif score.da_score < 0.7:
                 da_color = "yellow"
             else:
                 da_color = "red"
@@ -858,17 +913,17 @@ def print_detailed_trajectory(
                 do_color = "red"
             do_str = f"[{do_color}]{score.do_score:.3f}[/{do_color}]"
         
-        # Display weight if available
-        w_str = "—"
-        if weights and idx < len(weights):
-            w = weights[idx]
-            if w < 0.3:
-                w_color = "green"
-            elif w < 0.6:
-                w_color = "yellow"
+        # Display penalty if available
+        penalty_str = "—"
+        if penalties and idx < len(penalties):
+            penalty = penalties[idx]
+            if penalty < 0.3:
+                penalty_color = "green"
+            elif penalty < 0.6:
+                penalty_color = "yellow"
             else:
-                w_color = "red"
-            w_str = f"[{w_color}]{w:.3f}[/{w_color}]"
+                penalty_color = "red"
+            penalty_str = f"[{penalty_color}]{penalty:.3f}[/{penalty_color}]"
         
         do_type_str = score.do_type[:10] if score.do_type else "—"
 
@@ -878,7 +933,7 @@ def print_detailed_trajectory(
             f"[{ui_color}]{score.ui_score:.3f}[/{ui_color}]",
             da_str,
             do_str,
-            w_str,
+            penalty_str,
             do_type_str,
             score.content_preview[:35] + "...",
         )
@@ -928,8 +983,8 @@ def main():
     parser.add_argument(
         "--saup-config",
         type=json.loads,
-        default='{"alpha": 5.0, "beta": 5.0, "gamma": 5.0}',
-        help='SAUP-D weight configuration (JSON format, e.g., \'{"alpha": 1.0, "beta": 1.0, "gamma": 1.0}\')',
+        default='{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.2}',
+        help='SAUP-D weight configuration (JSON format, e.g., \'{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.2}\')',
     )
     parser.add_argument(
         "--no-auroc",
@@ -956,10 +1011,15 @@ def main():
         )
         results = Results.load(sim_path)
 
+        # Parse SAUP configuration from CLI arguments
+        saup_config = SAUPConfig(**args.saup_config)
+        console.print(f"[cyan]⚙️  SAUP Config: α={saup_config.alpha}, β={saup_config.beta}, γ={saup_config.gamma}[/cyan]")
+
         # Analyze
         console.print("[cyan]🔄 Analyzing trajectories and calculating uncertainty scores...[/cyan]")
         analysis = analyze_results(
             results,
+            config=saup_config,
             verbose=args.verbose,
             calculate_auroc=not args.no_auroc
         )

@@ -25,7 +25,8 @@ from tau2.metrics.uncertainty import (
     EmbeddingService,
     SAUPConfig,
     calculate_inference_gap,
-    calculate_inquiry_drift,
+    calculate_hybrid_repetition_score,
+    calculate_tool_repetition,
     calculate_saup_from_trajectory,
     get_uncertainty_stats,
 )
@@ -91,6 +92,8 @@ class Orchestrator:
         # Situational awareness tracking (reuses calculate_uncertainty flag)
         self.calculate_situational_awareness = calculate_uncertainty
         self.conversation_history: list[str] = []
+        self.agent_history: list[str] = []  # Track agent text responses for repetition detection
+        self.agent_tool_history: list[list] = []  # Track agent tool calls for duplicate detection
         self.initial_instruction: Optional[str] = None
         self.last_agent_message: Optional[str] = None
         
@@ -307,11 +310,11 @@ class Orchestrator:
         if self.calculate_uncertainty:
             try:
                 saup_result = calculate_saup_from_trajectory(messages, self.saup_config)
-                # Remove weights list from output (too verbose for JSON)
-                saup_metrics = {k: v for k, v in saup_result.items() if k != 'weights'}
+                # Remove penalties list from output (too verbose for JSON)
+                saup_metrics = {k: v for k, v in saup_result.items() if k != 'penalties'}
                 logger.info(
                     f"SAUP-D Score: {saup_metrics['saup_score']:.4f} "
-                    f"(N={saup_metrics['num_steps']}, mean_weight={saup_metrics['mean_weight']:.4f})"
+                    f"(N={saup_metrics['num_steps']}, mean_penalty={saup_metrics['mean_penalty']:.4f})"
                 )
             except Exception as e:
                 logger.warning(f"Failed to calculate SAUP score: {e}")
@@ -376,7 +379,8 @@ class Orchestrator:
         
         Calculates:
         - Uncertainty statistics (U_i): normalized entropy from logprobs
-        - Inquiry Drift (Da): semantic distance from initial goal
+        - Hybrid Repetition (Da): combines semantic + lexical similarity for agent messages
+        - Tool Repetition: exact duplicate tool call detection
         - Inference Gap (Do): semantic distance between action and observation
         
         Args:
@@ -402,17 +406,44 @@ class Orchestrator:
         
         # Calculate semantic distance metrics if situational awareness enabled
         if self.calculate_situational_awareness and self.embedding_service:
-            # Calculate Da (Inquiry Drift)
-            if self.initial_instruction and self.conversation_history:
+            # Calculate Da (Hybrid Repetition) for AGENT messages only
+            # Combines semantic similarity with lexical overlap to distinguish looping from enumeration
+            if isinstance(message, AssistantMessage):
                 try:
-                    da_score = calculate_inquiry_drift(
-                        self.initial_instruction,
-                        self.conversation_history
-                    )
+                    # Get current message content
+                    current_text = self._format_message_for_history(message)
+                    
+                    # Calculate text-based hybrid repetition
+                    text_repetition = 0.0
+                    if current_text:
+                        text_repetition = calculate_hybrid_repetition_score(
+                            current_text,
+                            self.agent_history
+                        )
+                        # Update agent history for next iteration
+                        self.agent_history.append(current_text)
+                    
+                    # Calculate tool-based repetition
+                    tool_repetition = 0.0
+                    if message.tool_calls:
+                        tool_repetition = calculate_tool_repetition(
+                            message.tool_calls,
+                            self.agent_tool_history
+                        )
+                        # Update tool history
+                        self.agent_tool_history.append(message.tool_calls)
+                    
+                    # Aggregate: max (worst-case penalty)
+                    # Either text looping OR tool duplication is a failure signal
+                    da_score = max(text_repetition, tool_repetition)
                     message.da_score = da_score
-                    logger.debug(f"Calculated Da for {message.role}: {da_score:.4f}")
+                    
+                    logger.debug(
+                        f"Calculated Da for agent: text_rep={text_repetition:.4f}, "
+                        f"tool_rep={tool_repetition:.4f}, final={da_score:.4f}"
+                    )
                 except Exception as e:
-                    logger.warning(f"Failed to calculate Da: {e}")
+                    logger.warning(f"Failed to calculate repetition score: {e}")
                     message.da_score = None
 
     def step(self):

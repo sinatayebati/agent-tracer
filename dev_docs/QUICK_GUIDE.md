@@ -66,9 +66,13 @@ python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
 # Don't save, just display results
 python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-save
 
-# Custom SAUP-D configuration (adjust α, β, γ weights)
+# Custom SAUP-D configuration (adjust α, β, γ weights, top-k, and ensemble)
 python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
-  --saup-config '{"alpha": 5.0, "beta": 5.0, "gamma": 5}'
+  --saup-config '{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.2}'
+
+# Disable ensemble (use pure top-k mean)
+python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
+  --saup-config '{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.0}'
 
 # Skip AUROC calculation (if ground truth not available)
 python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-auroc
@@ -77,6 +81,8 @@ python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-
 **Note**: By default, results are automatically saved to `data/uncertainty/` with the same filename as your simulation file for easy cross-referencing.
 
 **AUROC Calculation**: The script automatically calculates AUROC (Area Under ROC Curve) to evaluate whether SAUP-D scores predict task failure. Requires both SAUP scores and ground truth (reward) data.
+
+**SAUP-D Improvements**: The default configuration uses optimized ensemble method combining top-k aggregation (80%) with max risk (20%), improving AUROC from 0.6488 to 0.7007 (+8.0%). This captures both sustained problems and critical failure moments, achieving "good" predictive power.
 
 ### Batch Process All Simulations
 ```bash
@@ -91,6 +97,107 @@ python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-
 ```
 
 **Note on AUROC**: The uncertainty analysis script automatically calculates AUROC (Area Under ROC Curve) to evaluate whether SAUP-D scores can predict task failure. This is included in the standard analysis output when both SAUP scores and ground truth data are available.
+
+### Optimize SAUP Parameters
+Find the best SAUP-D parameters (α, β, γ, top-k, ensemble) for your dataset:
+
+```bash
+# AUTO MODE (Recommended): Run all 3 stages in one command
+# Results auto-save to data/optimization/ with same filename as input
+python -m tau2.scripts.optimize_saup_parameters \
+  data/simulations/my_simulation_results.json
+
+# Don't save, just display results
+python -m tau2.scripts.optimize_saup_parameters \
+  data/simulations/my_simulation_results.json \
+  --no-save
+
+# Stage 1: Coarse grid search only (explores wide parameter ranges)
+python -m tau2.scripts.optimize_saup_parameters \
+  data/simulations/my_simulation_results.json \
+  --mode coarse
+
+# Stage 2: Fine-grained search (refines around best coarse params)
+python -m tau2.scripts.optimize_saup_parameters \
+  data/simulations/my_simulation_results.json \
+  --mode fine \
+  --alpha-center 6.0 --alpha-range 3.0 --alpha-step 0.5 \
+  --topk-center 0.25 --topk-range 0.1 --topk-step 0.02
+
+# Stage 3: Ensemble optimization (tunes ensemble weight)
+python -m tau2.scripts.optimize_saup_parameters \
+  data/simulations/my_simulation_results.json \
+  --mode ensemble \
+  --alpha 4.0 --beta 4.0 --gamma 5.0 --top-k 0.26 \
+  --ensemble-weights 0.05 0.1 0.15 0.2 0.25 0.3
+
+# Custom grid search (specify your own parameter values)
+python -m tau2.scripts.optimize_saup_parameters \
+  data/simulations/my_simulation_results.json \
+  --mode custom \
+  --alpha-values 3.0 4.0 5.0 \
+  --beta-values 3.0 4.0 5.0 \
+  --gamma-values 4.0 5.0 6.0 \
+  --topk-values 0.2 0.25 0.3 \
+  --ensemble-values 0.15 0.2 0.25
+```
+
+**Input format**: The script accepts either:
+- A **single JSON file** containing multiple simulations (most common - each tau2 run creates one file with all simulations)
+- A **directory** containing multiple JSON files (will merge all simulations from all files)
+
+**Output**: By default, results are automatically saved to `data/optimization/` with the same filename as your input file for easy cross-referencing.
+
+**How it works**: The optimizer loads simulation(s), and systematically tests different parameter combinations to maximize AUROC (failure prediction accuracy). The script outputs the best configuration and shows stage-by-stage progress.
+
+**Optimization Modes**:
+- **auto** (default): Runs all 3 stages sequentially (coarse → fine → ensemble) for complete optimization
+- **coarse**: Tests 1,125 configurations across wide ranges (good for initial exploration)
+- **fine**: Tests ~315 configurations with finer granularity around a center point
+- **ensemble**: Tests different ensemble weights (mean top-k vs. max risk balance)
+- **custom**: Full control - specify exact values for all parameters
+
+**Example Output (Auto Mode)**:
+```
+Loading simulation file(s)...
+✓ Loaded my_simulation_results.json: 50 simulations
+✓ Loaded 50 simulations total
+
+STAGE 1/3: COARSE GRID SEARCH
+Testing 1125 configurations...
+✓ Stage 1 Complete: AUROC = 0.6856
+
+STAGE 2/3: FINE-GRAINED SEARCH
+Testing 315 configurations...
+✓ Stage 2 Complete: AUROC = 0.6890
+  Improvement: +0.0034
+
+STAGE 3/3: ENSEMBLE OPTIMIZATION
+Testing 9 configurations...
+✓ Stage 3 Complete: AUROC = 0.7007
+  Improvement: +0.0117
+
+OPTIMIZATION COMPLETE
+Stage-by-Stage Progress:
+  Stage 1 (Coarse):   AUROC = 0.6856 (1125 configs)
+  Stage 2 (Fine):     AUROC = 0.6890 (315 configs, +0.0034)
+  Stage 3 (Ensemble): AUROC = 0.7007 (9 configs, +0.0117)
+  
+  Total Improvement: +0.0151 (2.2%)
+
+Best Configuration:
+  Alpha (α): 4.0
+  Beta (β): 4.0
+  Gamma (γ): 5.0
+  Top-K Percentile: 0.26
+  Ensemble Weight (Max): 0.20
+  
+  AUROC: 0.7007
+
+✓ Results saved to data/optimization/my_simulation_results.json
+```
+
+**Note**: Requires simulation file(s) with ground truth labels (reward info). The auto mode optimization process takes 15-20 minutes for ~20 simulations (tests ~1,449 total configurations).
 
 ## 📝 Code Examples
 
