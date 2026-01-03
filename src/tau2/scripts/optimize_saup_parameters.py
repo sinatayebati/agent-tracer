@@ -98,8 +98,15 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRe
 from rich.table import Table
 
 from tau2.data_model.simulation import Results
-from tau2.metrics.uncertainty import SAUPConfig
+from tau2.metrics.uncertainty import SAUPConfig, calculate_normalized_entropy
 from tau2.scripts.analyze_uncertainty import analyze_results, calculate_auroc_metrics
+
+try:
+    from sklearn.metrics import roc_auc_score
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
+    logger.warning("scikit-learn not available. AUROC evaluation will be disabled.")
 
 
 def load_simulations_from_path(sim_path: Path) -> list[Results]:
@@ -177,13 +184,238 @@ def merge_results(results_list: list[Results]) -> Results:
     return merged
 
 
+def precompute_step_metrics(merged_results: Results, console: Console) -> list[dict]:
+    """
+    Phase 1: Pre-compute all step-level metrics (U_i, Da, Do) that are independent 
+    of alpha/beta/gamma/top_k/ensemble parameters.
+    
+    This function extracts and caches the expensive computations (especially embeddings)
+    that are properties of the simulation data itself and don't change across different
+    parameter configurations.
+    
+    Args:
+        merged_results: Merged simulation results
+        console: Rich console for progress display
+        
+    Returns:
+        List of pre-computed simulation data, where each item contains:
+        {
+            'steps': List of step dicts with {'ui', 'da', 'do_agent', 'do_user'},
+            'ground_truth_pass': bool (True if task succeeded)
+        }
+    """
+    from tau2.metrics.uncertainty import (
+        calculate_hybrid_repetition_score,
+        calculate_tool_repetition
+    )
+    
+    console.print("[bold cyan]Phase 1: Pre-computing step-level metrics (U_i, Da, Do)...[/bold cyan]")
+    console.print(f"Processing {len(merged_results.simulations)} simulations...")
+    
+    precomputed_data = []
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        task = progress.add_task("Pre-computing metrics...", total=len(merged_results.simulations))
+        
+        for simulation in merged_results.simulations:
+            sim_dict = simulation.model_dump()
+            
+            # Extract step-level metrics
+            step_data = []
+            
+            # Track agent history for repetition detection
+            agent_text_history = []
+            agent_tool_history = []
+            
+            for message in sim_dict.get("messages", []):
+                role = message.get("role")
+                
+                # Only process agent and user messages
+                if role not in ["assistant", "user"]:
+                    continue
+                
+                # Calculate U_i (normalized entropy) - INDEPENDENT of alpha/beta/gamma
+                logprobs = message.get("logprobs")
+                ui_score = calculate_normalized_entropy(logprobs)
+                
+                # Calculate Da (repetition) - INDEPENDENT of alpha/beta/gamma
+                da_score = None
+                if role == "assistant":
+                    content = message.get("content", "")
+                    if content is None:
+                        content = ""
+                    
+                    # Text-based hybrid repetition
+                    text_repetition = 0.0
+                    if content:
+                        text_repetition = calculate_hybrid_repetition_score(
+                            content, 
+                            agent_text_history
+                        )
+                        agent_text_history.append(content)
+                    
+                    # Tool-based repetition
+                    tool_repetition = 0.0
+                    tool_calls = message.get("tool_calls")
+                    if tool_calls:
+                        tool_repetition = calculate_tool_repetition(
+                            tool_calls,
+                            agent_tool_history
+                        )
+                        agent_tool_history.append(tool_calls)
+                    
+                    # Aggregate: max of text and tool repetition
+                    da_score = max(text_repetition, tool_repetition)
+                
+                # Extract Do (inference gap) - INDEPENDENT of alpha/beta/gamma
+                do_score = message.get("do_score")
+                do_type = message.get("do_type")
+                
+                # Store pre-computed step metrics
+                step_data.append({
+                    'ui': ui_score,
+                    'da': da_score,
+                    'do_agent': do_score if do_type == "agent_coherence" else None,
+                    'do_user': do_score if do_type == "user_coherence" else None
+                })
+            
+            # Extract ground truth
+            ground_truth = sim_dict.get("reward_info", {}).get("reward", None) if sim_dict.get("reward_info") else None
+            ground_truth_pass = ground_truth == 1.0 if ground_truth is not None else None
+            
+            precomputed_data.append({
+                'steps': step_data,
+                'ground_truth_pass': ground_truth_pass
+            })
+            
+            progress.update(task, advance=1)
+    
+    console.print(f"[green]✓ Pre-computation complete![/green]\n")
+    return precomputed_data
+
+
+def evaluate_config_fast(
+    config: SAUPConfig,
+    precomputed_data: list[dict],
+    verbose: bool = False
+) -> Optional[float]:
+    """
+    Phase 2: Fast evaluation using pre-computed step metrics.
+    
+    This function only performs the lightweight arithmetic operations:
+    - step_risk = U_i + alpha*Da + beta*Do_agent + gamma*Do_user
+    - top-k filtering
+    - ensemble aggregation
+    - AUROC calculation
+    
+    No expensive operations (embeddings, entropy calculations) are performed here.
+    
+    Args:
+        config: SAUP configuration to evaluate
+        precomputed_data: Pre-computed step metrics from Phase 1
+        verbose: If True, print detailed logs
+        
+    Returns:
+        AUROC score, or None if evaluation failed
+    """
+    if not SKLEARN_AVAILABLE:
+        if verbose:
+            logger.warning("scikit-learn not available")
+        return None
+    
+    try:
+        # Calculate SAUP scores for each simulation
+        y_scores = []
+        y_true = []
+        
+        for sim_data in precomputed_data:
+            steps = sim_data['steps']
+            ground_truth_pass = sim_data['ground_truth_pass']
+            
+            # Skip simulations without ground truth
+            if ground_truth_pass is None or not steps:
+                continue
+            
+            # Calculate step risks using simple arithmetic
+            step_risks = []
+            for step in steps:
+                ui = step['ui']
+                da = step['da'] if step['da'] is not None else 0.0
+                do_agent = step['do_agent'] if step['do_agent'] is not None else 0.0
+                do_user = step['do_user'] if step['do_user'] is not None else 0.0
+                
+                # Additive formula: risk = U_i + alpha*Da + beta*Do_agent + gamma*Do_user
+                penalty = config.alpha * da + config.beta * do_agent + config.gamma * do_user
+                step_risk = ui + penalty
+                step_risks.append(step_risk)
+            
+            if not step_risks:
+                continue
+            
+            # Top-k aggregation
+            if config.top_k_percentile >= 1.0:
+                top_k_risks = step_risks
+            else:
+                sorted_risks = sorted(step_risks, reverse=True)
+                top_k_count = max(1, int(config.top_k_percentile * len(step_risks)))
+                top_k_risks = sorted_risks[:top_k_count]
+            
+            # Calculate mean of top-k
+            mean_top_k = float(np.mean(top_k_risks))
+            
+            # Ensemble: combine top-k mean with max risk
+            if config.ensemble_weight_max > 0.0:
+                max_risk = float(np.max(step_risks))
+                saup_score = (1 - config.ensemble_weight_max) * mean_top_k + config.ensemble_weight_max * max_risk
+            else:
+                saup_score = mean_top_k
+            
+            # Store for AUROC calculation
+            y_scores.append(saup_score)
+            # Label encoding: Failure=1, Success=0
+            y_true.append(0 if ground_truth_pass else 1)
+        
+        # Calculate AUROC
+        if len(y_scores) < 2:
+            if verbose:
+                logger.warning(f"Not enough samples for AUROC ({len(y_scores)} < 2)")
+            return None
+        
+        y_scores_arr = np.array(y_scores)
+        y_true_arr = np.array(y_true)
+        
+        unique_labels = np.unique(y_true_arr)
+        if len(unique_labels) < 2:
+            if verbose:
+                logger.warning(f"Only one class present: {unique_labels}")
+            return None
+        
+        auroc = roc_auc_score(y_true_arr, y_scores_arr)
+        return float(auroc)
+    
+    except Exception as e:
+        if verbose:
+            logger.error(f"Failed to evaluate config: {e}")
+        return None
+
+
 def evaluate_config(
     config: SAUPConfig,
     merged_results: Results,
     verbose: bool = False
 ) -> Optional[float]:
     """
-    Evaluate a single SAUP configuration and return its AUROC.
+    Legacy evaluation function (slower, but complete).
+    
+    This function is kept for backward compatibility and non-optimization use cases.
+    For optimization, use precompute_step_metrics() + evaluate_config_fast() instead.
     
     Args:
         config: SAUP configuration to evaluate
@@ -216,7 +448,8 @@ def evaluate_config(
 
 def coarse_grid_search(
     merged_results: Results,
-    console: Console
+    console: Console,
+    precomputed_data: Optional[list[dict]] = None
 ) -> dict[str, Any]:
     """
     Stage 1: Coarse grid search over wide parameter ranges.
@@ -227,6 +460,11 @@ def coarse_grid_search(
         - gamma: [3, 4, 5, 6, 7]
         - top_k_percentile: [0.2, 0.25, 0.3, 0.35, 0.4]
         - ensemble_weight_max: fixed at 0.15
+    
+    Args:
+        merged_results: Merged simulation results (used only if precomputed_data is None)
+        console: Rich console for output
+        precomputed_data: Pre-computed step metrics (if None, will use legacy evaluation)
     
     Returns:
         Dictionary with best configuration and results
@@ -269,7 +507,11 @@ def coarse_grid_search(
                 ensemble_weight_max=ensemble_value
             )
             
-            auroc = evaluate_config(config, merged_results)
+            # Use fast evaluation if precomputed data available, otherwise fall back to legacy
+            if precomputed_data is not None:
+                auroc = evaluate_config_fast(config, precomputed_data)
+            else:
+                auroc = evaluate_config(config, merged_results)
             
             if auroc is not None:
                 results.append({
@@ -309,13 +551,14 @@ def fine_grained_search(
     topk_step: float = 0.01,
     beta: float = 4.0,
     gamma: float = 5.0,
-    ensemble: float = 0.15
+    ensemble: float = 0.15,
+    precomputed_data: Optional[list[dict]] = None
 ) -> dict[str, Any]:
     """
     Stage 2: Fine-grained search around best coarse parameters.
     
     Args:
-        merged_results: Merged simulation results
+        merged_results: Merged simulation results (used only if precomputed_data is None)
         console: Rich console for output
         alpha_center: Center value for alpha search
         alpha_range: Range around center (±range)
@@ -326,6 +569,7 @@ def fine_grained_search(
         beta: Fixed beta value
         gamma: Fixed gamma value
         ensemble: Fixed ensemble weight
+        precomputed_data: Pre-computed step metrics (if None, will use legacy evaluation)
         
     Returns:
         Dictionary with best configuration and results
@@ -372,7 +616,11 @@ def fine_grained_search(
                 ensemble_weight_max=ensemble
             )
             
-            auroc = evaluate_config(config, merged_results)
+            # Use fast evaluation if precomputed data available, otherwise fall back to legacy
+            if precomputed_data is not None:
+                auroc = evaluate_config_fast(config, precomputed_data)
+            else:
+                auroc = evaluate_config(config, merged_results)
             
             if auroc is not None:
                 results.append({
@@ -408,19 +656,21 @@ def ensemble_optimization(
     beta: float = 4.0,
     gamma: float = 5.0,
     topk: float = 0.26,
-    ensemble_weights: list[float] = None
+    ensemble_weights: list[float] = None,
+    precomputed_data: Optional[list[dict]] = None
 ) -> dict[str, Any]:
     """
     Stage 3: Optimize ensemble weight while keeping other parameters fixed.
     
     Args:
-        merged_results: Merged simulation results
+        merged_results: Merged simulation results (used only if precomputed_data is None)
         console: Rich console for output
         alpha: Fixed alpha value
         beta: Fixed beta value
         gamma: Fixed gamma value
         topk: Fixed top_k_percentile value
         ensemble_weights: List of ensemble weights to try
+        precomputed_data: Pre-computed step metrics (if None, will use legacy evaluation)
         
     Returns:
         Dictionary with best configuration and results
@@ -459,7 +709,11 @@ def ensemble_optimization(
                 ensemble_weight_max=ens
             )
             
-            auroc = evaluate_config(config, merged_results)
+            # Use fast evaluation if precomputed data available, otherwise fall back to legacy
+            if precomputed_data is not None:
+                auroc = evaluate_config_fast(config, precomputed_data)
+            else:
+                auroc = evaluate_config(config, merged_results)
             
             if auroc is not None:
                 results.append({
@@ -495,19 +749,21 @@ def custom_grid_search(
     beta_values: list[float],
     gamma_values: list[float],
     topk_values: list[float],
-    ensemble_values: list[float]
+    ensemble_values: list[float],
+    precomputed_data: Optional[list[dict]] = None
 ) -> dict[str, Any]:
     """
     Custom grid search with user-specified parameter values.
     
     Args:
-        merged_results: Merged simulation results
+        merged_results: Merged simulation results (used only if precomputed_data is None)
         console: Rich console for output
         alpha_values: List of alpha values to try
         beta_values: List of beta values to try
         gamma_values: List of gamma values to try
         topk_values: List of top_k_percentile values to try
         ensemble_values: List of ensemble_weight_max values to try
+        precomputed_data: Pre-computed step metrics (if None, will use legacy evaluation)
         
     Returns:
         Dictionary with best configuration and results
@@ -546,7 +802,11 @@ def custom_grid_search(
                 ensemble_weight_max=ens
             )
             
-            auroc = evaluate_config(config, merged_results)
+            # Use fast evaluation if precomputed data available, otherwise fall back to legacy
+            if precomputed_data is not None:
+                auroc = evaluate_config_fast(config, precomputed_data)
+            else:
+                auroc = evaluate_config(config, merged_results)
             
             if auroc is not None:
                 results.append({
@@ -741,6 +1001,13 @@ def main():
     total_sims = len(merged_results.simulations)
     console.print(f"[green]✓ Loaded {total_sims} simulations total[/green]\n")
     
+    # Pre-compute step-level metrics (Phase 1) - run once for all parameter searches
+    console.print("\n" + "=" * 80)
+    console.print("[bold magenta]PHASE 1: PRE-COMPUTING STEP METRICS[/bold magenta]", justify="center")
+    console.print("=" * 80 + "\n")
+    
+    precomputed_data = precompute_step_metrics(merged_results, console)
+    
     # Run optimization based on mode
     if args.mode == "auto":
         # Stage 1: Coarse grid search
@@ -748,7 +1015,7 @@ def main():
         console.print("[bold magenta]STAGE 1/3: COARSE GRID SEARCH[/bold magenta]", justify="center")
         console.print("=" * 80 + "\n")
         
-        coarse_results = coarse_grid_search(merged_results, console)
+        coarse_results = coarse_grid_search(merged_results, console, precomputed_data)
         best_coarse = coarse_results['best_config']
         
         console.print(f"\n[green]✓ Stage 1 Complete: AUROC = {coarse_results['best_auroc']:.4f}[/green]")
@@ -770,7 +1037,8 @@ def main():
             topk_step=0.01,
             beta=best_coarse['beta'],
             gamma=best_coarse['gamma'],
-            ensemble=best_coarse['ensemble_weight_max']
+            ensemble=best_coarse['ensemble_weight_max'],
+            precomputed_data=precomputed_data
         )
         best_fine = fine_results['best_config']
         
@@ -791,7 +1059,8 @@ def main():
             beta=best_fine['beta'],
             gamma=best_fine['gamma'],
             topk=best_fine['top_k_percentile'],
-            ensemble_weights=ensemble_weights
+            ensemble_weights=ensemble_weights,
+            precomputed_data=precomputed_data
         )
         
         console.print(f"\n[green]✓ Stage 3 Complete: AUROC = {ensemble_results['best_auroc']:.4f}[/green]")
@@ -833,7 +1102,7 @@ def main():
         }
     
     elif args.mode == "coarse":
-        optimization_results = coarse_grid_search(merged_results, console)
+        optimization_results = coarse_grid_search(merged_results, console, precomputed_data)
     
     elif args.mode == "fine":
         optimization_results = fine_grained_search(
@@ -847,7 +1116,8 @@ def main():
             topk_step=args.topk_step,
             beta=args.beta,
             gamma=args.gamma,
-            ensemble=args.ensemble_weights[0] if args.ensemble_weights else 0.15
+            ensemble=args.ensemble_weights[0] if args.ensemble_weights else 0.15,
+            precomputed_data=precomputed_data
         )
     
     elif args.mode == "ensemble":
@@ -858,7 +1128,8 @@ def main():
             beta=args.beta,
             gamma=args.gamma,
             topk=args.top_k,
-            ensemble_weights=args.ensemble_weights
+            ensemble_weights=args.ensemble_weights,
+            precomputed_data=precomputed_data
         )
     
     elif args.mode == "custom":
@@ -880,7 +1151,8 @@ def main():
             beta_values=args.beta_values,
             gamma_values=args.gamma_values,
             topk_values=args.topk_values,
-            ensemble_values=args.ensemble_values
+            ensemble_values=args.ensemble_values,
+            precomputed_data=precomputed_data
         )
     
     # Add metadata
