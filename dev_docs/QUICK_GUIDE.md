@@ -139,11 +139,11 @@ python -m tau2.scripts.optimize_saup_parameters \
 python -m tau2.scripts.optimize_saup_parameters \
   data/simulations/my_simulation_results.json \
   --mode custom \
-  --alpha-values 3.0 4.0 5.0 \
-  --beta-values 3.0 4.0 5.0 \
-  --gamma-values 4.0 5.0 6.0 \
-  --topk-values 0.2 0.25 0.3 \
-  --ensemble-values 0.15 0.2 0.25
+  --alpha-values 1.25 1.5 1.75 2.0 2.25 2.5 \
+  --beta-values 7.0 7.5 8.0 8.5 9.0 \
+  --gamma-values 2.5 3.0 3.5 4.0 \
+  --topk-values 0.20 0.21 0.22 0.23 0.24 \
+  --ensemble-values 0.0 0.15 0.2 0.25
 ```
 
 **How it works**: The optimizer loads simulation(s), and systematically tests different parameter combinations to maximize AUROC (failure prediction accuracy). The script outputs the best configuration and shows stage-by-stage progress.
