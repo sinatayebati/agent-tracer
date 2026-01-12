@@ -70,10 +70,6 @@ python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-
 python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
   --saup-config '{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.2}'
 
-# Disable ensemble (use pure top-k mean)
-python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json \
-  --saup-config '{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.0}'
-
 # Skip AUROC calculation (if ground truth not available)
 python -m tau2.scripts.analyze_uncertainty data/simulations/your_file.json --no-auroc
 ```
@@ -109,8 +105,6 @@ This means fine-grained searches with 300+ configurations now complete in minute
 
 ```bash
 # AUTO MODE (Recommended): Run all 3 stages in one command
-# Results auto-save to data/optimization/ with same filename as input
-# Phase 1 (pre-computation) runs once, then all 3 stages use cached metrics
 python -m tau2.scripts.optimize_saup_parameters \
   data/simulations/my_simulation_results.json
 
@@ -152,18 +146,6 @@ python -m tau2.scripts.optimize_saup_parameters \
   --ensemble-values 0.15 0.2 0.25
 ```
 
-**Expected Performance (113 simulations, ~20 steps each):**
-- Pre-computation: ~5-10 minutes (once)
-- Each configuration: <1 second (vs. ~10-30 seconds legacy)
-- Fine-grained search (315 configs): ~5 minutes (vs. ~2-3 hours legacy)
-- Full auto mode (1449 configs): ~10-15 minutes total
-
-**Input format**: The script accepts either:
-- A **single JSON file** containing multiple simulations (most common - each tau2 run creates one file with all simulations)
-- A **directory** containing multiple JSON files (will merge all simulations from all files)
-
-**Output**: By default, results are automatically saved to `data/optimization/` with the same filename as your input file for easy cross-referencing.
-
 **How it works**: The optimizer loads simulation(s), and systematically tests different parameter combinations to maximize AUROC (failure prediction accuracy). The script outputs the best configuration and shows stage-by-stage progress.
 
 **Optimization Modes**:
@@ -172,46 +154,6 @@ python -m tau2.scripts.optimize_saup_parameters \
 - **fine**: Tests ~315 configurations with finer granularity around a center point
 - **ensemble**: Tests different ensemble weights (mean top-k vs. max risk balance)
 - **custom**: Full control - specify exact values for all parameters
-
-**Example Output (Auto Mode)**:
-```
-Loading simulation file(s)...
-✓ Loaded my_simulation_results.json: 50 simulations
-✓ Loaded 50 simulations total
-
-STAGE 1/3: COARSE GRID SEARCH
-Testing 1125 configurations...
-✓ Stage 1 Complete: AUROC = 0.6856
-
-STAGE 2/3: FINE-GRAINED SEARCH
-Testing 315 configurations...
-✓ Stage 2 Complete: AUROC = 0.6890
-  Improvement: +0.0034
-
-STAGE 3/3: ENSEMBLE OPTIMIZATION
-Testing 9 configurations...
-✓ Stage 3 Complete: AUROC = 0.7007
-  Improvement: +0.0117
-
-OPTIMIZATION COMPLETE
-Stage-by-Stage Progress:
-  Stage 1 (Coarse):   AUROC = 0.6856 (1125 configs)
-  Stage 2 (Fine):     AUROC = 0.6890 (315 configs, +0.0034)
-  Stage 3 (Ensemble): AUROC = 0.7007 (9 configs, +0.0117)
-  
-  Total Improvement: +0.0151 (2.2%)
-
-Best Configuration:
-  Alpha (α): 4.0
-  Beta (β): 4.0
-  Gamma (γ): 5.0
-  Top-K Percentile: 0.26
-  Ensemble Weight (Max): 0.20
-  
-  AUROC: 0.7007
-
-✓ Results saved to data/optimization/my_simulation_results.json
-```
 
 **Note**: Requires simulation file(s) with ground truth labels (reward info). The auto mode optimization process takes 15-20 minutes for ~20 simulations (tests ~1,449 total configurations).
 
