@@ -469,9 +469,9 @@ def coarse_grid_search(
     Returns:
         Dictionary with best configuration and results
     """
-    alpha_values = [3, 4, 5, 6, 7, 8, 10, 12, 15]
+    alpha_values = [2, 3, 4, 5, 6, 7, 8, 10, 12, 15]
     beta_values = [3, 4, 5, 6, 7]
-    gamma_values = [3, 4, 5, 6, 7]
+    gamma_values = [2, 3, 4, 5, 6, 7]
     topk_values = [0.2, 0.25, 0.3, 0.35, 0.4]
     ensemble_value = 0.15  # Fixed for coarse search
     
