@@ -43,6 +43,8 @@ from tau2.metrics.uncertainty import (
     calculate_saup_score,
     calculate_tracer_score,
     get_uncertainty_stats,
+    calculate_hybrid_repetition_score,
+    calculate_tool_repetition
 )
 
 # Optional sklearn import for AUROC calculation
@@ -112,6 +114,7 @@ class UncertaintyAnalysis(BaseModel):
     results: list[SimulationUncertainty]
     auroc_metrics: Optional[AUROCMetrics] = None
     baseline_aurocs: Optional[dict] = None
+    ablation_studies: Optional[dict] = None  # Stores ablation analysis results
 
 
 def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = False) -> SimulationUncertainty:
@@ -130,11 +133,6 @@ def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = F
     Returns:
         SimulationUncertainty: Analyzed uncertainty data
     """
-    from tau2.metrics.uncertainty import (
-        calculate_hybrid_repetition_score,
-        calculate_tool_repetition
-    )
-    
     uncertainty_scores = []
     turn_counter = 0
     
@@ -289,7 +287,11 @@ def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = F
     )
 
 
-def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optional[AUROCMetrics]:
+def calculate_auroc_metrics(
+    analyzed_sims: list[SimulationUncertainty], 
+    role_filter: Optional[str] = None,
+    config: Optional[TRACERConfig] = None
+) -> Optional[AUROCMetrics]:
     """
     Calculate AUROC metrics for TRACER failure prediction.
     
@@ -298,6 +300,8 @@ def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optio
     
     Args:
         analyzed_sims: List of analyzed simulations with TRACER metrics
+        role_filter: Optional role filter ("assistant" or "user"). If None, uses all turns.
+        config: TRACER configuration (only needed if role_filter is specified)
         
     Returns:
         AUROCMetrics if calculation successful, None otherwise
@@ -311,11 +315,42 @@ def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optio
     y_true = []
     
     for sim in analyzed_sims:
-        # Need both TRACER score and ground truth
-        if sim.tracer_metrics is None or sim.ground_truth_pass is None:
+        # Need ground truth
+        if sim.ground_truth_pass is None:
             continue
         
-        tracer_score = sim.tracer_metrics.get('tracer_score')
+        # If role_filter is specified, recalculate TRACER with filtered turns
+        if role_filter is not None:
+            if config is None:
+                config = TRACERConfig()
+            
+            # Filter uncertainty scores by role
+            # Map role to actor: "assistant" -> "agent", "user" -> "user"
+            target_actor = "agent" if role_filter == "assistant" else "user"
+            filtered_scores = [s for s in sim.uncertainty_scores if s.actor == target_actor]
+            
+            if not filtered_scores:
+                continue
+            
+            # Build step_data from filtered scores
+            step_data = [
+                {
+                    "ui": turn.ui_score,
+                    "da": turn.da_score,
+                    "do_agent": turn.do_score if turn.do_type == "agent_coherence" else None,
+                    "do_user": turn.do_score if turn.do_type == "user_coherence" else None
+                }
+                for turn in filtered_scores
+            ]
+            
+            tracer_result = calculate_tracer_score(step_data, config)
+            tracer_score = tracer_result.get('tracer_score')
+        else:
+            # Use pre-calculated TRACER score from full analysis
+            if sim.tracer_metrics is None:
+                continue
+            tracer_score = sim.tracer_metrics.get('tracer_score')
+        
         if tracer_score is None:
             continue
         
@@ -385,17 +420,25 @@ def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optio
         return None
 
 
-def calculate_baseline_aurocs(analyzed_sims: list[SimulationUncertainty], original_results: Results = None) -> Optional[dict]:
+def calculate_baseline_aurocs(
+    analyzed_sims: list[SimulationUncertainty], 
+    original_results: Results = None,
+    role_filter: Optional[str] = None,
+    config: Optional[TRACERConfig] = None
+) -> Optional[dict]:
     """
     Calculate AUROC metrics for baseline predictors using the same schema as TRACER.
     
-    This function evaluates two simple baseline metrics to compare against TRACER:
-    1. Normalized Entropy only (mean U_i across agent messages)
+    This function evaluates baseline metrics to compare against TRACER:
+    1. Normalized Entropy only (mean U_i)
     2. Self-assessed Confidence (extracted from original simulation messages if available)
+    3. SAUP (multiplicative weighting with RMS aggregation)
     
     Args:
         analyzed_sims: List of analyzed simulations with summary statistics
         original_results: Original Results object to extract self-assessed confidence
+        role_filter: Optional role filter ("assistant" or "user"). If None, uses all turns.
+        config: TRACER configuration (only needed for SAUP and if role_filter is specified)
         
     Returns:
         Dictionary with baseline metrics matching TRACER AUROC schema, or None if calculation fails
@@ -404,9 +447,14 @@ def calculate_baseline_aurocs(analyzed_sims: list[SimulationUncertainty], origin
         logger.warning("scikit-learn not available. Skipping baseline AUROC calculation.")
         return None
     
+    if config is None:
+        config = TRACERConfig()
+    
     results = {}
     
+    #########################################################################################
     # Baseline 1: Normalized Entropy (U_i) only
+    #########################################################################################
     y_scores_entropy = []
     y_true_entropy = []
     
@@ -414,9 +462,20 @@ def calculate_baseline_aurocs(analyzed_sims: list[SimulationUncertainty], origin
         if sim.ground_truth_pass is None:
             continue
         
-        mean_uncertainty = sim.summary.get('mean_uncertainty_agent')
-        if mean_uncertainty is None:
-            continue
+        # If role_filter is specified, recalculate mean uncertainty for filtered turns
+        if role_filter is not None:
+            target_actor = "agent" if role_filter == "assistant" else "user"
+            filtered_scores = [s for s in sim.uncertainty_scores if s.actor == target_actor]
+            
+            if not filtered_scores:
+                continue
+            
+            mean_uncertainty = float(np.mean([s.ui_score for s in filtered_scores]))
+        else:
+            # Full analysis: Use mean_uncertainty_overall (all steps), consistent with TRACER
+            mean_uncertainty = sim.summary.get('mean_uncertainty_overall')
+            if mean_uncertainty is None:
+                continue
         
         # Label encoding: Failure=1, Success=0
         ground_truth = 0 if sim.ground_truth_pass else 1
@@ -475,7 +534,9 @@ def calculate_baseline_aurocs(analyzed_sims: list[SimulationUncertainty], origin
         except Exception as e:
             logger.warning(f"Failed to calculate AUROC for normalized entropy baseline: {e}")
     
+    #########################################################################################
     # Baseline 2: Self-assessed Confidence (extract from original simulation data)
+    #########################################################################################
     y_scores_confidence = []
     y_true_confidence = []
     
@@ -489,18 +550,28 @@ def calculate_baseline_aurocs(analyzed_sims: list[SimulationUncertainty], origin
             ground_truth_pass = ground_truth_reward == 1.0
             ground_truth = 0 if ground_truth_pass else 1
             
-            # Extract self-assessed confidence from agent messages
-            agent_confidences = []
+            # Extract self-assessed confidence from messages based on role_filter
+            confidences = []
             for msg in sim.messages:
-                if msg.role == "assistant" and hasattr(msg, 'uncertainty') and msg.uncertainty is not None:
+                # Apply role filter
+                if role_filter is not None:
+                    if msg.role != role_filter:
+                        continue
+                else:
+                    # Full analysis: Use ALL messages (both assistant and user), consistent with TRACER
+                    # Only filter out system messages
+                    if msg.role not in ["assistant", "user"]:
+                        continue
+                
+                if hasattr(msg, 'uncertainty') and msg.uncertainty is not None:
                     confidence = msg.uncertainty.get('self_assessed_confidence')
                     if confidence is not None:
-                        agent_confidences.append(confidence)
+                        confidences.append(confidence)
             
-            if not agent_confidences:
+            if not confidences:
                 continue
             
-            mean_confidence = float(np.mean(agent_confidences))
+            mean_confidence = float(np.mean(confidences))
             y_scores_confidence.append(mean_confidence)
             y_true_confidence.append(ground_truth)
     
@@ -557,23 +628,30 @@ def calculate_baseline_aurocs(analyzed_sims: list[SimulationUncertainty], origin
     else:
         logger.info("Self-assessed confidence data not available or insufficient for baseline calculation")
     
+    #########################################################################################
     # Baseline 3: SAUP (multiplicative weighting with RMS aggregation)
+    #########################################################################################
     y_scores_saup = []
     y_true_saup = []
-    
-    # Use default TRACER config for consistency
-    default_config = TRACERConfig()
     
     for sim in analyzed_sims:
         if sim.ground_truth_pass is None:
             continue
         
-        # Build step_data from uncertainty_scores
+        # Filter by role if specified
+        if role_filter is not None:
+            target_actor = "agent" if role_filter == "assistant" else "user"
+            filtered_scores = [s for s in sim.uncertainty_scores if s.actor == target_actor]
+        else:
+            # Full analysis: Use ALL steps (both agent and user), consistent with TRACER
+            filtered_scores = sim.uncertainty_scores
+        
+        if not filtered_scores:
+            continue
+        
+        # Build step_data from filtered uncertainty_scores
         step_data = []
-        for score in sim.uncertainty_scores:
-            if score.actor != "agent":
-                continue  # SAUP only uses agent steps
-            
+        for score in filtered_scores:
             # Extract do_agent and do_user based on do_type
             do_agent = None
             do_user = None
@@ -594,7 +672,7 @@ def calculate_baseline_aurocs(analyzed_sims: list[SimulationUncertainty], origin
             continue
         
         # Calculate SAUP score
-        saup_result = calculate_saup_score(step_data, default_config)
+        saup_result = calculate_saup_score(step_data, config)
         saup_score = saup_result['saup_score']
         
         # Label encoding: Failure=1, Success=0
@@ -694,15 +772,67 @@ def analyze_results(results: Results, config: TRACERConfig, verbose: bool = Fals
     # Calculate AUROC metrics if requested and TRACER scores are available
     auroc_metrics = None
     baseline_aurocs = None
+    ablation_studies = None
+    
     if calculate_auroc:
+        # Full analysis (default - uses all turns for TRACER, agent-only for baselines)
         auroc_metrics = calculate_auroc_metrics(analyzed_sims)
         baseline_aurocs = calculate_baseline_aurocs(analyzed_sims, original_results=results)
+        
+        # Ablation studies: isolate assistant-only and user-only
+        logger.info("Running ablation studies...")
+        ablation_studies = {}
+        
+        # Ablation 1: Assistant-only (role="assistant", actor="agent")
+        logger.info("  - Assistant-only ablation")
+        assistant_auroc = calculate_auroc_metrics(
+            analyzed_sims, 
+            role_filter="assistant", 
+            config=config
+        )
+        assistant_baselines = calculate_baseline_aurocs(
+            analyzed_sims, 
+            original_results=results,
+            role_filter="assistant",
+            config=config
+        )
+        
+        if assistant_auroc or assistant_baselines:
+            ablation_studies['assistant_only'] = {
+                'description': 'Analysis using only assistant (agent) turns',
+                'auroc_metrics': assistant_auroc,
+                'baseline_aurocs': assistant_baselines
+            }
+        
+        # Ablation 2: User-only (role="user", actor="user")
+        logger.info("  - User-only ablation")
+        user_auroc = calculate_auroc_metrics(
+            analyzed_sims, 
+            role_filter="user",
+            config=config
+        )
+        user_baselines = calculate_baseline_aurocs(
+            analyzed_sims, 
+            original_results=results,
+            role_filter="user",
+            config=config
+        )
+        
+        if user_auroc or user_baselines:
+            ablation_studies['user_only'] = {
+                'description': 'Analysis using only user turns',
+                'auroc_metrics': user_auroc,
+                'baseline_aurocs': user_baselines
+            }
+        
+        logger.info(f"Completed {len(ablation_studies)} ablation studies")
 
     return UncertaintyAnalysis(
         metadata=metadata,
         results=analyzed_sims,
         auroc_metrics=auroc_metrics,
-        baseline_aurocs=baseline_aurocs
+        baseline_aurocs=baseline_aurocs,
+        ablation_studies=ablation_studies
     )
 
 
@@ -1148,6 +1278,77 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                 console.print(f"  [yellow]   Best baseline: {best_baseline_name} (AUROC={best_baseline_auroc:.4f})[/yellow]")
         else:
             console.print("  [yellow]⚠️  TRACER AUROC not available for comparison[/yellow]")
+
+    # Ablation Studies
+    if analysis.ablation_studies is not None and len(analysis.ablation_studies) > 0:
+        console.print("\n[bold cyan]Ablation Studies[/bold cyan]")
+        console.print("  Analyzing impact of isolating assistant vs. user turns:\n")
+        
+        for ablation_key, ablation_data in analysis.ablation_studies.items():
+            ablation_auroc = ablation_data.get('auroc_metrics')
+            ablation_baselines = ablation_data.get('baseline_aurocs')
+            description = ablation_data.get('description', ablation_key)
+            
+            console.print(f"\n[bold white]{description}[/bold white]")
+            
+            if ablation_auroc or ablation_baselines:
+                # Create ablation table
+                ablation_table = Table(show_header=True, header_style="bold magenta")
+                ablation_table.add_column("Metric", style="white", width=35)
+                ablation_table.add_column("AUROC", justify="right", width=10)
+                ablation_table.add_column("Accuracy", justify="right", width=10)
+                ablation_table.add_column("Precision", justify="right", width=10)
+                ablation_table.add_column("Recall", justify="right", width=10)
+                ablation_table.add_column("F1", justify="right", width=10)
+                
+                # Add TRACER row if available
+                if ablation_auroc is not None:
+                    ablation_table.add_row(
+                        "[bold]TRACER[/bold]",
+                        f"[bold]{ablation_auroc.auroc:.4f}[/bold]",
+                        f"[bold]{ablation_auroc.accuracy:.4f}[/bold]",
+                        f"[bold]{ablation_auroc.precision:.4f}[/bold]",
+                        f"[bold]{ablation_auroc.recall:.4f}[/bold]",
+                        f"[bold]{ablation_auroc.f1_score:.4f}[/bold]"
+                    )
+                
+                # Add baseline rows
+                if ablation_baselines is not None:
+                    baseline_names = {
+                        'saup': 'SAUP',
+                        'normalized_entropy': 'Normalized Entropy',
+                        'self_assessed_confidence': 'Self-Assessed Confidence'
+                    }
+                    
+                    for baseline_key, baseline_metrics in ablation_baselines.items():
+                        display_name = baseline_names.get(baseline_key, baseline_key)
+                        
+                        ablation_table.add_row(
+                            display_name,
+                            f"{baseline_metrics['auroc']:.4f}",
+                            f"{baseline_metrics['accuracy']:.4f}",
+                            f"{baseline_metrics['precision']:.4f}",
+                            f"{baseline_metrics['recall']:.4f}",
+                            f"{baseline_metrics['f1_score']:.4f}"
+                        )
+                
+                console.print(ablation_table)
+                console.print()
+                
+                # Compare with full analysis
+                if analysis.auroc_metrics is not None and ablation_auroc is not None:
+                    full_auroc = analysis.auroc_metrics.auroc
+                    ablation_auroc_val = ablation_auroc.auroc
+                    diff = ablation_auroc_val - full_auroc
+                    
+                    if abs(diff) < 0.02:
+                        console.print(f"  → Similar performance to full analysis (Δ={diff:+.4f})")
+                    elif diff > 0:
+                        console.print(f"  [green]→ Better than full analysis (Δ={diff:+.4f})[/green]")
+                    else:
+                        console.print(f"  [yellow]→ Worse than full analysis (Δ={diff:+.4f})[/yellow]")
+            else:
+                console.print("  [yellow]⚠️  No metrics available for this ablation[/yellow]")
 
     # Per-simulation summary
     console.print("\n[bold cyan]Per-Simulation Summary[/bold cyan]\n")

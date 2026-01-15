@@ -371,26 +371,34 @@ class Orchestrator:
         
         return ""
     
-    def _elicit_self_assessed_confidence(self, message: AssistantMessage) -> Optional[float]:
+    def _elicit_self_assessed_confidence(self, message: Message) -> Optional[float]:
         """
-        Elicit self-assessed confidence from the agent for its response.
+        Elicit self-assessed confidence from the agent or user for their response.
         
-        Makes a secondary LLM call to ask the agent to rate its confidence
-        in the response it just provided. This is used as a baseline metric
+        Makes a secondary LLM call to ask the agent/user to rate their confidence
+        in the response they just provided. This is used as a baseline metric
         for comparison with TRACER.
         
         Args:
-            message: The AssistantMessage to elicit confidence for
+            message: The AssistantMessage or UserMessage to elicit confidence for
             
         Returns:
             Optional[float]: Confidence score in [0.0, 1.0], or None if elicitation fails
         """
         try:
-            # Format the agent's response for the confidence prompt
+            # Determine if this is an agent or user message
+            is_agent = isinstance(message, AssistantMessage)
+            is_user = isinstance(message, UserMessage)
+            
+            if not (is_agent or is_user):
+                logger.debug("Message is neither AssistantMessage nor UserMessage")
+                return None
+            
+            # Format the response for the confidence prompt
             response_parts = []
             if message.content:
                 response_parts.append(message.content)
-            if message.tool_calls:
+            if hasattr(message, 'tool_calls') and message.tool_calls:
                 for tool_call in message.tool_calls:
                     tool_str = f"Tool call: {tool_call.name}({tool_call.arguments})"
                     response_parts.append(tool_str)
@@ -401,8 +409,9 @@ class Orchestrator:
             
             response_text = " | ".join(response_parts)
             
-            # Construct the confidence elicitation prompt
-            confidence_prompt = f"""You just provided the following response:
+            # Construct the confidence elicitation prompt (different for agent vs user)
+            if is_agent:
+                confidence_prompt = f"""You just provided the following response:
 {response_text}
 
 TASK: Rate your confidence that this response is correct, helpful, and will successfully address the user's need.
@@ -425,13 +434,45 @@ Report your confidence as a single number from 0.0 to 1.0:
 Be calibrated: If you're unsure, report lower confidence. Accuracy matters more than optimism.
 
 Your confidence score (just the number):"""
+            else:  # is_user
+                confidence_prompt = f"""You just provided the following message:
+{response_text}
+
+TASK: Rate your confidence that this message clearly and correctly expresses your need/request.
+
+IMPORTANT: Be honest and precise. Consider:
+- Is your request clear and unambiguous?
+- Do you have all the information needed to make this request?
+- Are you certain about what you're asking for?
+- Could the agent misinterpret your request?
+- Are you making assumptions about what's available or possible?
+
+Report your confidence as a single number from 0.0 to 1.0:
+- 1.0 = Completely certain: Your request is crystal clear and you know exactly what you need
+- 0.8 = High confidence: Request is clear, minor ambiguity possible
+- 0.6 = Moderate confidence: Somewhat clear, but some uncertainty about specifics
+- 0.4 = Low confidence: Significant uncertainty about what you're requesting
+- 0.2 = Very uncertain: Unclear about your needs or how to express them
+- 0.0 = No confidence: Very confused or unable to articulate your request
+
+Be calibrated: If you're unsure, report lower confidence. Honesty matters more than optimism.
+
+Your confidence score (just the number):"""
             
             # Prepare LLM arguments (copy and override specific settings)
             from copy import deepcopy
             from tau2.data_model.message import UserMessage as ConfidenceUserMessage
             from tau2.utils.llm_utils import generate
             
-            llm_args_copy = deepcopy(self.agent.llm_args)
+            # Get the appropriate LLM and args based on message type
+            if is_agent:
+                llm = self.agent.llm
+                llm_args_base = self.agent.llm_args
+            else:  # is_user
+                llm = self.user.llm
+                llm_args_base = self.user.llm_args
+            
+            llm_args_copy = deepcopy(llm_args_base)
             llm_args_copy.update({
                 "temperature": 0.1,
                 "max_tokens": 500,  # Increased to handle longer prompts and prevent truncation
@@ -440,7 +481,7 @@ Your confidence score (just the number):"""
             
             # Make the secondary LLM call
             confidence_message = generate(
-                model=self.agent.llm,
+                model=llm,
                 messages=[ConfidenceUserMessage(role="user", content=confidence_prompt)],
                 tools=None,  # No tools needed for this query
                 **llm_args_copy
@@ -506,15 +547,16 @@ Your confidence score (just the number):"""
                 f"(tokens={uncertainty_stats.token_count})"
             )
         
-        # Elicit self-assessed confidence for AGENT messages
+        # Elicit self-assessed confidence for AGENT and USER messages
         # This is a baseline metric for comparison with TRACER
-        if isinstance(message, AssistantMessage):
+        if isinstance(message, (AssistantMessage, UserMessage)):
             confidence = self._elicit_self_assessed_confidence(message)
             if message.uncertainty is None:
                 message.uncertainty = {}
             message.uncertainty['self_assessed_confidence'] = confidence
             if confidence is not None:
-                logger.debug(f"Self-assessed confidence: {confidence:.4f}")
+                actor_type = "agent" if isinstance(message, AssistantMessage) else "user"
+                logger.debug(f"Self-assessed confidence ({actor_type}): {confidence:.4f}")
         
         # Calculate semantic distance metrics if situational awareness enabled
         if self.calculate_situational_awareness and self.embedding_service:
