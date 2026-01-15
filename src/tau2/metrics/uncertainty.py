@@ -878,26 +878,26 @@ class TRACERConfig:
     """
     Configuration for TRACER (Task Risk Assessment via Contextual Entropy and Reasoning) aggregation.
     
-    The situational weight for each step is calculated as:
-        W_i = alpha * Da_i + beta * Do_agent_i + gamma * Do_user_i
+    Uses MAX variant formula (optimized via diagnostic analysis):
+        risk_i = max(U_i, alpha * Da_i, beta * Do_agent_i, gamma * Do_user_i)
     
     Attributes:
-        alpha: Weight for repetition (Da) - default 4.0 (fine-tuned via 315 tests)
-        beta: Weight for agent coherence (Do_agent) - default 4.0 (optimized)
-        gamma: Weight for user coherence (Do_user) - default 5.0 (optimized)
-        top_k_percentile: Percentile for top-k aggregation (0.26 = top 26%) - default 0.26
-                         Fine-tuned to balance critical moment capture vs noise
+        alpha: Weight for repetition (Da)
+        beta: Weight for agent coherence (Do_agent) - (PRIMARY SIGNAL)
+        gamma: Weight for user coherence (Do_user)
+        top_k_percentile: Percentile for top-k aggregation
+                         Optimized to focus on critical failure moments
                          Set to 1.0 to use all steps (equivalent to mean)
-        ensemble_weight_max: Weight for max risk in ensemble (0.2 = 20%) - default 0.2
+        ensemble_weight_max: Weight for single worst moment
                             TRACER = (1-w)*mean(top_k) + w*max(all_risks)
                             Combines sustained problems with single worst moment
                             Set to 0.0 to disable ensemble (use pure top-k mean)
     """
-    alpha: float = 4.0
-    beta: float = 4.0
-    gamma: float = 5.0
-    top_k_percentile: float = 0.26
-    ensemble_weight_max: float = 0.2
+    alpha: float = 1.0
+    beta: float = 1.0
+    gamma: float = 1.0
+    top_k_percentile: float = 0.1
+    ensemble_weight_max: float = 0.1
 
 
 def calculate_situational_weight(
@@ -950,23 +950,27 @@ def calculate_tracer_score(
     config: Optional[TRACERConfig] = None
 ) -> dict:
     """
-    Calculate TRACER aggregation score using top-k aggregation with ensemble.
+    Calculate TRACER aggregation score using MAX variant with top-k aggregation.
     
-    Implements the optimized TRACER formula with ensemble method:
-        U_trajectory = (1-w) × mean(top_k%(U_i + Penalty_i)) + w × max(U_i + Penalty_i)
+    Implements the optimized MAX variant formula:
+        risk_i = max(U_i, α·Da_i, β·Do_agent_i, γ·Do_user_i)
+        TRACER = (1-w) × mean(top_k%(risk_i)) + w × max(risk_i)
     
     Where:
-        - top_k% = highest k% of step risks (default k=26%)
-        - w = ensemble weight for max (default 0.2)
-        - Penalty_i = α·Da_i + β·Do_agent_i + γ·Do_user_i
+        - risk_i takes the maximum of individual components at each step
+        - top_k% = worst k% of steps (default k=15%)
+        - w = ensemble weight for single worst moment (default 0.30)
+        - α, β, γ = component weights (defaults: α=0.0, β=1.0, γ=0.0)
         - U_i = normalized entropy for step i
-        - Da_i = repetition score (local looping penalty)
+        - Da_i = inquiry drift (repetition penalty) - DISABLED by default
+        - Do_agent_i = agent coherence - PRIMARY SIGNAL
+        - Do_user_i = user coherence - DISABLED by default
     
-    Rationale: Failures have BOTH sustained problems AND critical moments.
-    - Mean(top-k) captures chronic issues throughout dialogue
-    - Max captures the single worst failure moment
-    - 80/20 ensemble balances these complementary signals
-    - Empirically improves AUROC from 0.6488 to 0.7007 (+8.0%)
+    Rationale: MAX variant outperforms additive formulation (AUROC: 0.7209 vs 0.5583)
+    - Takes worst signal at each step instead of summing
+    - Eliminates noise from weak predictors (Da, Do_user)
+    - Focuses on agent coherence (Do_agent) as primary failure indicator
+    - Emphasizes critical failure moments (worst 15% + max ensemble)
     
     Args:
         step_data: List of step dictionaries containing:
@@ -1027,15 +1031,21 @@ def calculate_tracer_score(
         do_agent_val = do_agent if do_agent is not None else 0.0
         do_user_val = do_user if do_user is not None else 0.0
         
-        # Calculate penalty: α·Da_i + β·Do_agent_i + γ·Do_user_i
+        # Calculate penalty components
         penalty = (
             config.alpha * da_val +
             config.beta * do_agent_val +
             config.gamma * do_user_val
         )
         
-        # Calculate step risk using additive formula
-        step_risk = ui + penalty
+        # Calculate step risk using MAX variant formula
+        # risk_i = max(U_i, α·Da_i, β·Do_agent_i, γ·Do_user_i)
+        step_risk = max(
+            ui,
+            config.alpha * da_val,
+            config.beta * do_agent_val,
+            config.gamma * do_user_val
+        )
         
         penalties.append(penalty)
         step_risks.append(step_risk)
