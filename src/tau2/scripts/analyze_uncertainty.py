@@ -2,7 +2,7 @@
 Uncertainty Analysis Script
 
 Analyzes Tau-2 simulation trajectories and calculates uncertainty metrics
-using the SAUP framework.
+using the TRACER framework.
 
 By default, results are saved to data/uncertainty/ with the same filename as the input.
 
@@ -38,9 +38,10 @@ from rich.table import Table
 
 from tau2.data_model.simulation import Results
 from tau2.metrics.uncertainty import (
-    SAUPConfig,
+    TRACERConfig,
     calculate_normalized_entropy,
     calculate_saup_score,
+    calculate_tracer_score,
     get_uncertainty_stats,
 )
 
@@ -82,7 +83,7 @@ class SimulationUncertainty(BaseModel):
     turn_count: int
     uncertainty_scores: list[TurnUncertainty]
     summary: dict
-    saup_metrics: Optional[dict] = None
+    tracer_metrics: Optional[dict] = None
     ground_truth_pass: Optional[bool] = None
 
 
@@ -98,10 +99,10 @@ class AUROCMetrics(BaseModel):
     num_samples: int
     num_failures: int
     num_successes: int
-    mean_saup_failures: float
-    mean_saup_successes: float
-    std_saup_failures: float
-    std_saup_successes: float
+    mean_tracer_failures: float
+    mean_tracer_successes: float
+    std_tracer_failures: float
+    std_tracer_successes: float
 
 
 class UncertaintyAnalysis(BaseModel):
@@ -110,9 +111,10 @@ class UncertaintyAnalysis(BaseModel):
     metadata: dict
     results: list[SimulationUncertainty]
     auroc_metrics: Optional[AUROCMetrics] = None
+    baseline_aurocs: Optional[dict] = None
 
 
-def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = False) -> SimulationUncertainty:
+def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = False) -> SimulationUncertainty:
     """
     Analyze a single simulation and extract uncertainty scores.
 
@@ -122,7 +124,7 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
 
     Args:
         simulation: A simulation run dictionary
-        config: SAUP configuration for weighted aggregation
+        config: TRACER configuration for weighted aggregation
         verbose: If True, include detailed statistics
 
     Returns:
@@ -221,8 +223,8 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
 
         uncertainty_scores.append(turn_data)
 
-    # Calculate SAUP-D aggregation score (using ADDITIVE formula)
-    saup_metrics = None
+    # Calculate TRACER aggregation score (using ADDITIVE formula)
+    tracer_metrics = None
     if uncertainty_scores:
         step_data = [
             {
@@ -233,9 +235,9 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
             }
             for turn in uncertainty_scores
         ]
-        saup_result = calculate_saup_score(step_data, config)
+        tracer_result = calculate_tracer_score(step_data, config)
         # Remove penalties list (too verbose)
-        saup_metrics = {k: v for k, v in saup_result.items() if k != 'penalties'}
+        tracer_metrics = {k: v for k, v in tracer_result.items() if k != 'penalties'}
     
     # Extract ground truth (task success)
     ground_truth = simulation.get("reward_info", {}).get("reward", None) if simulation.get("reward_info") else None
@@ -282,20 +284,20 @@ def analyze_simulation(simulation: dict, config: SAUPConfig, verbose: bool = Fal
         turn_count=len(uncertainty_scores),
         uncertainty_scores=uncertainty_scores,
         summary=summary,
-        saup_metrics=saup_metrics,
+        tracer_metrics=tracer_metrics,
         ground_truth_pass=ground_truth_pass,
     )
 
 
 def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optional[AUROCMetrics]:
     """
-    Calculate AUROC metrics for SAUP-D failure prediction.
+    Calculate AUROC metrics for TRACER failure prediction.
     
-    Hypothesis: High SAUP-D score predicts task failure.
+    Hypothesis: High TRACER score predicts task failure.
     Label encoding: Failure=1, Success=0
     
     Args:
-        analyzed_sims: List of analyzed simulations with SAUP metrics
+        analyzed_sims: List of analyzed simulations with TRACER metrics
         
     Returns:
         AUROCMetrics if calculation successful, None otherwise
@@ -304,23 +306,23 @@ def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optio
         logger.warning("scikit-learn not available. Skipping AUROC calculation.")
         return None
     
-    # Extract SAUP scores and ground truth labels
+    # Extract TRACER scores and ground truth labels
     y_scores = []
     y_true = []
     
     for sim in analyzed_sims:
-        # Need both SAUP score and ground truth
-        if sim.saup_metrics is None or sim.ground_truth_pass is None:
+        # Need both TRACER score and ground truth
+        if sim.tracer_metrics is None or sim.ground_truth_pass is None:
             continue
         
-        saup_score = sim.saup_metrics.get('saup_score')
-        if saup_score is None:
+        tracer_score = sim.tracer_metrics.get('tracer_score')
+        if tracer_score is None:
             continue
         
         # Label encoding: Failure=1, Success=0
         ground_truth = 0 if sim.ground_truth_pass else 1
         
-        y_scores.append(saup_score)
+        y_scores.append(tracer_score)
         y_true.append(ground_truth)
     
     # Need at least 2 samples and both classes present
@@ -373,23 +375,300 @@ def calculate_auroc_metrics(analyzed_sims: list[SimulationUncertainty]) -> Optio
             num_samples=len(y_scores),
             num_failures=int(np.sum(y_true == 1)),
             num_successes=int(np.sum(y_true == 0)),
-            mean_saup_failures=float(np.mean(failures)) if len(failures) > 0 else 0.0,
-            mean_saup_successes=float(np.mean(successes)) if len(successes) > 0 else 0.0,
-            std_saup_failures=float(np.std(failures)) if len(failures) > 0 else 0.0,
-            std_saup_successes=float(np.std(successes)) if len(successes) > 0 else 0.0,
+            mean_tracer_failures=float(np.mean(failures)) if len(failures) > 0 else 0.0,
+            mean_tracer_successes=float(np.mean(successes)) if len(successes) > 0 else 0.0,
+            std_tracer_failures=float(np.std(failures)) if len(failures) > 0 else 0.0,
+            std_tracer_successes=float(np.std(successes)) if len(successes) > 0 else 0.0,
         )
     except Exception as e:
         logger.error(f"Failed to calculate AUROC: {e}")
         return None
 
 
-def analyze_results(results: Results, config: SAUPConfig, verbose: bool = False, calculate_auroc: bool = True) -> UncertaintyAnalysis:
+def calculate_baseline_aurocs(analyzed_sims: list[SimulationUncertainty], original_results: Results = None) -> Optional[dict]:
+    """
+    Calculate AUROC metrics for baseline predictors using the same schema as TRACER.
+    
+    This function evaluates two simple baseline metrics to compare against TRACER:
+    1. Normalized Entropy only (mean U_i across agent messages)
+    2. Self-assessed Confidence (extracted from original simulation messages if available)
+    
+    Args:
+        analyzed_sims: List of analyzed simulations with summary statistics
+        original_results: Original Results object to extract self-assessed confidence
+        
+    Returns:
+        Dictionary with baseline metrics matching TRACER AUROC schema, or None if calculation fails
+    """
+    if not SKLEARN_AVAILABLE:
+        logger.warning("scikit-learn not available. Skipping baseline AUROC calculation.")
+        return None
+    
+    results = {}
+    
+    # Baseline 1: Normalized Entropy (U_i) only
+    y_scores_entropy = []
+    y_true_entropy = []
+    
+    for sim in analyzed_sims:
+        if sim.ground_truth_pass is None:
+            continue
+        
+        mean_uncertainty = sim.summary.get('mean_uncertainty_agent')
+        if mean_uncertainty is None:
+            continue
+        
+        # Label encoding: Failure=1, Success=0
+        ground_truth = 0 if sim.ground_truth_pass else 1
+        
+        y_scores_entropy.append(mean_uncertainty)
+        y_true_entropy.append(ground_truth)
+    
+    # Calculate metrics for normalized entropy baseline
+    if len(y_scores_entropy) >= 2 and len(np.unique(y_true_entropy)) == 2:
+        try:
+            y_scores_entropy = np.array(y_scores_entropy)
+            y_true_entropy = np.array(y_true_entropy)
+            
+            # Calculate AUROC
+            auroc = roc_auc_score(y_true_entropy, y_scores_entropy)
+            
+            # Find optimal threshold
+            fpr, tpr, thresholds = roc_curve(y_true_entropy, y_scores_entropy)
+            j_scores = tpr - fpr
+            optimal_idx = np.argmax(j_scores)
+            optimal_threshold = thresholds[optimal_idx]
+            
+            # Calculate metrics at optimal threshold
+            y_pred = (y_scores_entropy >= optimal_threshold).astype(int)
+            
+            accuracy = accuracy_score(y_true_entropy, y_pred)
+            precision = precision_score(y_true_entropy, y_pred, zero_division=0)
+            recall = recall_score(y_true_entropy, y_pred, zero_division=0)
+            
+            # F1 score
+            if precision + recall > 0:
+                f1_score_val = 2 * (precision * recall) / (precision + recall)
+            else:
+                f1_score_val = 0.0
+            
+            # Statistics by class
+            failures = y_scores_entropy[y_true_entropy == 1]
+            successes = y_scores_entropy[y_true_entropy == 0]
+            
+            results['normalized_entropy'] = {
+                'auroc': float(auroc),
+                'accuracy': float(accuracy),
+                'precision': float(precision),
+                'recall': float(recall),
+                'f1_score': float(f1_score_val),
+                'optimal_threshold': float(optimal_threshold),
+                'num_samples': len(y_scores_entropy),
+                'num_failures': int(np.sum(y_true_entropy == 1)),
+                'num_successes': int(np.sum(y_true_entropy == 0)),
+                'mean_tracer_failures': float(np.mean(failures)) if len(failures) > 0 else 0.0,
+                'mean_tracer_successes': float(np.mean(successes)) if len(successes) > 0 else 0.0,
+                'std_tracer_failures': float(np.std(failures)) if len(failures) > 0 else 0.0,
+                'std_tracer_successes': float(np.std(successes)) if len(successes) > 0 else 0.0,
+            }
+            logger.info(f"Normalized Entropy baseline AUROC: {auroc:.4f}")
+        except Exception as e:
+            logger.warning(f"Failed to calculate AUROC for normalized entropy baseline: {e}")
+    
+    # Baseline 2: Self-assessed Confidence (extract from original simulation data)
+    y_scores_confidence = []
+    y_true_confidence = []
+    
+    if original_results is not None:
+        for sim in original_results.simulations:
+            # Get ground truth
+            ground_truth_reward = sim.reward_info.reward if sim.reward_info else None
+            if ground_truth_reward is None:
+                continue
+            
+            ground_truth_pass = ground_truth_reward == 1.0
+            ground_truth = 0 if ground_truth_pass else 1
+            
+            # Extract self-assessed confidence from agent messages
+            agent_confidences = []
+            for msg in sim.messages:
+                if msg.role == "assistant" and hasattr(msg, 'uncertainty') and msg.uncertainty is not None:
+                    confidence = msg.uncertainty.get('self_assessed_confidence')
+                    if confidence is not None:
+                        agent_confidences.append(confidence)
+            
+            if not agent_confidences:
+                continue
+            
+            mean_confidence = float(np.mean(agent_confidences))
+            y_scores_confidence.append(mean_confidence)
+            y_true_confidence.append(ground_truth)
+    
+    # Calculate metrics for self-assessed confidence baseline
+    if len(y_scores_confidence) >= 2 and len(np.unique(y_true_confidence)) == 2:
+        try:
+            y_scores_confidence = np.array(y_scores_confidence)
+            y_true_confidence = np.array(y_true_confidence)
+            
+            # Calculate AUROC
+            auroc = roc_auc_score(y_true_confidence, y_scores_confidence)
+            
+            # Find optimal threshold
+            fpr, tpr, thresholds = roc_curve(y_true_confidence, y_scores_confidence)
+            j_scores = tpr - fpr
+            optimal_idx = np.argmax(j_scores)
+            optimal_threshold = thresholds[optimal_idx]
+            
+            # Calculate metrics at optimal threshold
+            y_pred = (y_scores_confidence >= optimal_threshold).astype(int)
+            
+            accuracy = accuracy_score(y_true_confidence, y_pred)
+            precision = precision_score(y_true_confidence, y_pred, zero_division=0)
+            recall = recall_score(y_true_confidence, y_pred, zero_division=0)
+            
+            # F1 score
+            if precision + recall > 0:
+                f1_score_val = 2 * (precision * recall) / (precision + recall)
+            else:
+                f1_score_val = 0.0
+            
+            # Statistics by class
+            failures = y_scores_confidence[y_true_confidence == 1]
+            successes = y_scores_confidence[y_true_confidence == 0]
+            
+            results['self_assessed_confidence'] = {
+                'auroc': float(auroc),
+                'accuracy': float(accuracy),
+                'precision': float(precision),
+                'recall': float(recall),
+                'f1_score': float(f1_score_val),
+                'optimal_threshold': float(optimal_threshold),
+                'num_samples': len(y_scores_confidence),
+                'num_failures': int(np.sum(y_true_confidence == 1)),
+                'num_successes': int(np.sum(y_true_confidence == 0)),
+                'mean_tracer_failures': float(np.mean(failures)) if len(failures) > 0 else 0.0,
+                'mean_tracer_successes': float(np.mean(successes)) if len(successes) > 0 else 0.0,
+                'std_tracer_failures': float(np.std(failures)) if len(failures) > 0 else 0.0,
+                'std_tracer_successes': float(np.std(successes)) if len(successes) > 0 else 0.0,
+            }
+            logger.info(f"Self-assessed Confidence baseline AUROC: {auroc:.4f}")
+        except Exception as e:
+            logger.warning(f"Failed to calculate AUROC for self-assessed confidence baseline: {e}")
+    else:
+        logger.info("Self-assessed confidence data not available or insufficient for baseline calculation")
+    
+    # Baseline 3: SAUP (multiplicative weighting with RMS aggregation)
+    y_scores_saup = []
+    y_true_saup = []
+    
+    # Use default TRACER config for consistency
+    default_config = TRACERConfig()
+    
+    for sim in analyzed_sims:
+        if sim.ground_truth_pass is None:
+            continue
+        
+        # Build step_data from uncertainty_scores
+        step_data = []
+        for score in sim.uncertainty_scores:
+            if score.actor != "agent":
+                continue  # SAUP only uses agent steps
+            
+            # Extract do_agent and do_user based on do_type
+            do_agent = None
+            do_user = None
+            if score.do_score is not None and score.do_type is not None:
+                if score.do_type == 'agent_coherence':
+                    do_agent = score.do_score
+                elif score.do_type == 'user_coherence':
+                    do_user = score.do_score
+            
+            step_data.append({
+                'ui': score.ui_score,
+                'da': score.da_score,
+                'do_agent': do_agent,
+                'do_user': do_user
+            })
+        
+        if not step_data:
+            continue
+        
+        # Calculate SAUP score
+        saup_result = calculate_saup_score(step_data, default_config)
+        saup_score = saup_result['saup_score']
+        
+        # Label encoding: Failure=1, Success=0
+        ground_truth = 0 if sim.ground_truth_pass else 1
+        
+        y_scores_saup.append(saup_score)
+        y_true_saup.append(ground_truth)
+    
+    # Calculate metrics for SAUP baseline
+    if len(y_scores_saup) >= 2 and len(np.unique(y_true_saup)) == 2:
+        try:
+            y_scores_saup = np.array(y_scores_saup)
+            y_true_saup = np.array(y_true_saup)
+            
+            # Calculate AUROC
+            auroc = roc_auc_score(y_true_saup, y_scores_saup)
+            
+            # Find optimal threshold
+            fpr, tpr, thresholds = roc_curve(y_true_saup, y_scores_saup)
+            j_scores = tpr - fpr
+            optimal_idx = np.argmax(j_scores)
+            optimal_threshold = thresholds[optimal_idx]
+            
+            # Calculate metrics at optimal threshold
+            y_pred = (y_scores_saup >= optimal_threshold).astype(int)
+            
+            accuracy = accuracy_score(y_true_saup, y_pred)
+            precision = precision_score(y_true_saup, y_pred, zero_division=0)
+            recall = recall_score(y_true_saup, y_pred, zero_division=0)
+            
+            # F1 score
+            if precision + recall > 0:
+                f1_score_val = 2 * (precision * recall) / (precision + recall)
+            else:
+                f1_score_val = 0.0
+            
+            # Statistics by class
+            failures = y_scores_saup[y_true_saup == 1]
+            successes = y_scores_saup[y_true_saup == 0]
+            
+            results['saup'] = {
+                'auroc': float(auroc),
+                'accuracy': float(accuracy),
+                'precision': float(precision),
+                'recall': float(recall),
+                'f1_score': float(f1_score_val),
+                'optimal_threshold': float(optimal_threshold),
+                'num_samples': len(y_scores_saup),
+                'num_failures': int(np.sum(y_true_saup == 1)),
+                'num_successes': int(np.sum(y_true_saup == 0)),
+                'mean_tracer_failures': float(np.mean(failures)) if len(failures) > 0 else 0.0,
+                'mean_tracer_successes': float(np.mean(successes)) if len(successes) > 0 else 0.0,
+                'std_tracer_failures': float(np.std(failures)) if len(failures) > 0 else 0.0,
+                'std_tracer_successes': float(np.std(successes)) if len(successes) > 0 else 0.0,
+            }
+            logger.info(f"SAUP baseline AUROC: {auroc:.4f}")
+        except Exception as e:
+            logger.warning(f"Failed to calculate AUROC for SAUP baseline: {e}")
+    
+    if not results:
+        logger.warning("No baseline AUROCs could be calculated")
+        return None
+    
+    logger.info(f"Calculated {len(results)} baseline metric(s)")
+    return results
+
+
+def analyze_results(results: Results, config: TRACERConfig, verbose: bool = False, calculate_auroc: bool = True) -> UncertaintyAnalysis:
     """
     Analyze all simulations in the results.
 
     Args:
         results: Tau-2 simulation results
-        config: SAUP configuration for weighted aggregation
+        config: TRACER configuration for weighted aggregation
         verbose: If True, include detailed statistics
         calculate_auroc: If True, calculate AUROC metrics for failure prediction
 
@@ -412,15 +691,18 @@ def analyze_results(results: Results, config: SAUPConfig, verbose: bool = False,
         "user_llm": results.info.user_info.llm,
     }
     
-    # Calculate AUROC metrics if requested and SAUP scores are available
+    # Calculate AUROC metrics if requested and TRACER scores are available
     auroc_metrics = None
+    baseline_aurocs = None
     if calculate_auroc:
         auroc_metrics = calculate_auroc_metrics(analyzed_sims)
+        baseline_aurocs = calculate_baseline_aurocs(analyzed_sims, original_results=results)
 
     return UncertaintyAnalysis(
         metadata=metadata,
         results=analyzed_sims,
-        auroc_metrics=auroc_metrics
+        auroc_metrics=auroc_metrics,
+        baseline_aurocs=baseline_aurocs
     )
 
 
@@ -542,47 +824,47 @@ def print_uncertainty_summary_from_results(
                 console.print(f"    Mean: {np.mean(all_do_user):.4f}")
                 console.print(f"    Count: {len(all_do_user)}")
     
-    # SAUP-D Aggregation Scores
-    all_saup_scores = []
-    saup_passed = []
-    saup_failed = []
+    # TRACER Aggregation Scores
+    all_tracer_scores = []
+    tracer_passed = []
+    tracer_failed = []
     
     for sim in results.simulations:
-        if hasattr(sim, 'saup_metrics') and sim.saup_metrics is not None:
-            saup_score = sim.saup_metrics.get('saup_score')
-            if saup_score is not None:
-                all_saup_scores.append(saup_score)
+        if hasattr(sim, 'tracer_metrics') and sim.tracer_metrics is not None:
+            tracer_score = sim.tracer_metrics.get('tracer_score')
+            if tracer_score is not None:
+                all_tracer_scores.append(tracer_score)
                 
                 # Track by ground truth
                 if hasattr(sim, 'reward_info') and sim.reward_info is not None:
                     reward = sim.reward_info.reward
                     if reward == 1.0:
-                        saup_passed.append(saup_score)
+                        tracer_passed.append(tracer_score)
                     else:
-                        saup_failed.append(saup_score)
+                        tracer_failed.append(tracer_score)
     
-    if all_saup_scores:
-        console.print("\n[bold cyan]SAUP-D Aggregation Scores[/bold cyan]")
-        console.print(f"  Mean SAUP: {np.mean(all_saup_scores):.4f}")
-        console.print(f"  Std SAUP:  {np.std(all_saup_scores):.4f}")
-        console.print(f"  Min SAUP:  {np.min(all_saup_scores):.4f}")
-        console.print(f"  Max SAUP:  {np.max(all_saup_scores):.4f}")
-        console.print(f"  Total simulations: {len(all_saup_scores)}")
+    if all_tracer_scores:
+        console.print("\n[bold cyan]TRACER Aggregation Scores[/bold cyan]")
+        console.print(f"  Mean TRACER: {np.mean(all_tracer_scores):.4f}")
+        console.print(f"  Std TRACER:  {np.std(all_tracer_scores):.4f}")
+        console.print(f"  Min TRACER:  {np.min(all_tracer_scores):.4f}")
+        console.print(f"  Max TRACER:  {np.max(all_tracer_scores):.4f}")
+        console.print(f"  Total simulations: {len(all_tracer_scores)}")
         
         # Ground truth correlation
-        if saup_passed or saup_failed:
-            total_with_gt = len(saup_passed) + len(saup_failed)
-            console.print(f"\n  Ground Truth: {len(saup_passed)}/{total_with_gt} passed ({100*len(saup_passed)/total_with_gt:.1f}%)")
-            if saup_passed:
-                console.print(f"  Mean SAUP (passed): {np.mean(saup_passed):.4f}")
-            if saup_failed:
-                console.print(f"  Mean SAUP (failed): {np.mean(saup_failed):.4f}")
+        if tracer_passed or tracer_failed:
+            total_with_gt = len(tracer_passed) + len(tracer_failed)
+            console.print(f"\n  Ground Truth: {len(tracer_passed)}/{total_with_gt} passed ({100*len(tracer_passed)/total_with_gt:.1f}%)")
+            if tracer_passed:
+                console.print(f"  Mean TRACER (passed): {np.mean(tracer_passed):.4f}")
+            if tracer_failed:
+                console.print(f"  Mean TRACER (failed): {np.mean(tracer_failed):.4f}")
             
             # Quick AUROC estimate (inline calculation for real-time summary)
-            if SKLEARN_AVAILABLE and len(saup_passed) > 0 and len(saup_failed) > 0:
+            if SKLEARN_AVAILABLE and len(tracer_passed) > 0 and len(tracer_failed) > 0:
                 try:
-                    y_scores_inline = np.array(saup_passed + saup_failed)
-                    y_true_inline = np.array([0]*len(saup_passed) + [1]*len(saup_failed))
+                    y_scores_inline = np.array(tracer_passed + tracer_failed)
+                    y_true_inline = np.array([0]*len(tracer_passed) + [1]*len(tracer_failed))
                     auroc_inline = roc_auc_score(y_true_inline, y_scores_inline)
                     
                     auroc_color = "green" if auroc_inline > 0.7 else "yellow" if auroc_inline > 0.6 else "red"
@@ -714,46 +996,46 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                 console.print(f"    Mean: {np.mean(all_do_user):.4f}")
                 console.print(f"    Count: {len(all_do_user)}")
     
-    # SAUP-D Aggregation Scores
-    all_saup_scores = []
-    saup_passed = []
-    saup_failed = []
+    # TRACER Aggregation Scores
+    all_tracer_scores = []
+    tracer_passed = []
+    tracer_failed = []
     
     for sim in analysis.results:
-        if sim.saup_metrics is not None:
-            saup_score = sim.saup_metrics.get('saup_score')
-            if saup_score is not None:
-                all_saup_scores.append(saup_score)
+        if sim.tracer_metrics is not None:
+            tracer_score = sim.tracer_metrics.get('tracer_score')
+            if tracer_score is not None:
+                all_tracer_scores.append(tracer_score)
                 
                 # Track by ground truth
                 if sim.ground_truth_pass is not None:
                     if sim.ground_truth_pass:
-                        saup_passed.append(saup_score)
+                        tracer_passed.append(tracer_score)
                     else:
-                        saup_failed.append(saup_score)
+                        tracer_failed.append(tracer_score)
     
-    if all_saup_scores:
-        console.print("\n[bold cyan]SAUP-D Aggregation Scores[/bold cyan]")
-        console.print(f"  Mean SAUP: {np.mean(all_saup_scores):.4f}")
-        console.print(f"  Std SAUP:  {np.std(all_saup_scores):.4f}")
-        console.print(f"  Min SAUP:  {np.min(all_saup_scores):.4f}")
-        console.print(f"  Max SAUP:  {np.max(all_saup_scores):.4f}")
-        console.print(f"  Total simulations: {len(all_saup_scores)}")
+    if all_tracer_scores:
+        console.print("\n[bold cyan]TRACER Aggregation Scores[/bold cyan]")
+        console.print(f"  Mean TRACER: {np.mean(all_tracer_scores):.4f}")
+        console.print(f"  Std TRACER:  {np.std(all_tracer_scores):.4f}")
+        console.print(f"  Min TRACER:  {np.min(all_tracer_scores):.4f}")
+        console.print(f"  Max TRACER:  {np.max(all_tracer_scores):.4f}")
+        console.print(f"  Total simulations: {len(all_tracer_scores)}")
         
         # Ground truth correlation
-        if saup_passed or saup_failed:
-            total_with_gt = len(saup_passed) + len(saup_failed)
-            console.print(f"\n  Ground Truth: {len(saup_passed)}/{total_with_gt} passed ({100*len(saup_passed)/total_with_gt:.1f}%)")
-            if saup_passed:
-                console.print(f"  Mean SAUP (passed): {np.mean(saup_passed):.4f}")
-            if saup_failed:
-                console.print(f"  Mean SAUP (failed): {np.mean(saup_failed):.4f}")
+        if tracer_passed or tracer_failed:
+            total_with_gt = len(tracer_passed) + len(tracer_failed)
+            console.print(f"\n  Ground Truth: {len(tracer_passed)}/{total_with_gt} passed ({100*len(tracer_passed)/total_with_gt:.1f}%)")
+            if tracer_passed:
+                console.print(f"  Mean TRACER (passed): {np.mean(tracer_passed):.4f}")
+            if tracer_failed:
+                console.print(f"  Mean TRACER (failed): {np.mean(tracer_failed):.4f}")
     
     # AUROC Evaluation (Failure Prediction)
     if analysis.auroc_metrics is not None:
         auroc = analysis.auroc_metrics
-        console.print("\n[bold cyan]AUROC Evaluation (Failure Prediction)[/bold cyan]")
-        console.print(f"  Hypothesis: High SAUP-D → High probability of failure")
+        console.print("\n[bold cyan]TRACER Evaluation (Failure Prediction)[/bold cyan]")
+        console.print(f"  Hypothesis: High TRACER → High probability of failure")
         console.print(f"  Dataset: {auroc.num_samples} tasks ({auroc.num_failures} failures, {auroc.num_successes} successes)")
         console.print()
         
@@ -785,17 +1067,87 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
         # Interpretation
         console.print()
         if auroc_value > 0.7:
-            console.print(f"  [green]✅ SAUP-D has {auroc_label.lower()} predictive power for task failure![/green]")
-            console.print(f"  [green]   Tasks with SAUP-D > {auroc.optimal_threshold:.4f} are at high risk of failure.[/green]")
+            console.print(f"  [green]✅ TRACER has {auroc_label.lower()} predictive power for task failure![/green]")
+            console.print(f"  [green]   Tasks with TRACER > {auroc.optimal_threshold:.4f} are at high risk of failure.[/green]")
         elif auroc_value > 0.6:
-            console.print(f"  [yellow]⚠️  SAUP-D shows fair predictive power (AUROC={auroc_value:.4f}).[/yellow]")
+            console.print(f"  [yellow]⚠️  TRACER shows fair predictive power (AUROC={auroc_value:.4f}).[/yellow]")
             console.print(f"  [yellow]   Consider combining with other features or tuning α,β,γ weights.[/yellow]")
         else:
-            console.print(f"  [red]❌ SAUP-D shows poor predictive power (AUROC={auroc_value:.4f}).[/red]")
+            console.print(f"  [red]❌ TRACER shows poor predictive power (AUROC={auroc_value:.4f}).[/red]")
             if auroc.num_samples < 30:
                 console.print(f"  [yellow]   Note: Small sample size ({auroc.num_samples}) limits statistical power.[/yellow]")
             else:
                 console.print(f"  [yellow]   The hypothesis may not hold for this dataset/configuration.[/yellow]")
+    
+    # Baseline Comparison
+    if analysis.baseline_aurocs is not None and len(analysis.baseline_aurocs) > 0:
+        console.print("\n[bold cyan]Baseline Comparison[/bold cyan]")
+        console.print("  Comparing TRACER against simpler baseline metrics:\n")
+        
+        # Create comparison table
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Metric", style="white", width=35)
+        table.add_column("AUROC", justify="right", width=10)
+        table.add_column("Accuracy", justify="right", width=10)
+        table.add_column("Precision", justify="right", width=10)
+        table.add_column("Recall", justify="right", width=10)
+        table.add_column("F1", justify="right", width=10)
+        
+        # Add TRACER as first row
+        tracer_auroc_obj = analysis.auroc_metrics
+        
+        if tracer_auroc_obj is not None:
+            table.add_row(
+                "[bold]TRACER (Full Framework)[/bold]",
+                f"[bold]{tracer_auroc_obj.auroc:.4f}[/bold]",
+                f"[bold]{tracer_auroc_obj.accuracy:.4f}[/bold]",
+                f"[bold]{tracer_auroc_obj.precision:.4f}[/bold]",
+                f"[bold]{tracer_auroc_obj.recall:.4f}[/bold]",
+                f"[bold]{tracer_auroc_obj.f1_score:.4f}[/bold]"
+            )
+            
+            # Add baseline rows
+            baseline_names = {
+                'saup': 'SAUP (RMS Weighted Uncertainty)',
+                'normalized_entropy': 'Normalized Entropy (U_i) Only',
+                'self_assessed_confidence': 'Self-Assessed Confidence Only'
+            }
+            
+            for baseline_key, baseline_metrics in analysis.baseline_aurocs.items():
+                display_name = baseline_names.get(baseline_key, baseline_key)
+                
+                table.add_row(
+                    display_name,
+                    f"{baseline_metrics['auroc']:.4f}",
+                    f"{baseline_metrics['accuracy']:.4f}",
+                    f"{baseline_metrics['precision']:.4f}",
+                    f"{baseline_metrics['recall']:.4f}",
+                    f"{baseline_metrics['f1_score']:.4f}"
+                )
+            
+            console.print(table)
+            console.print()
+            
+            # Interpretation
+            best_baseline_auroc = max(b['auroc'] for b in analysis.baseline_aurocs.values())
+            best_baseline_key = max(
+                analysis.baseline_aurocs.items(),
+                key=lambda x: x[1]['auroc']
+            )[0]
+            best_baseline_name = baseline_names.get(best_baseline_key, best_baseline_key)
+            
+            improvement = tracer_auroc_obj.auroc - best_baseline_auroc
+            
+            if improvement > 0.05:
+                console.print(f"  [green]✅ TRACER outperforms all baseline metrics[/green]")
+                console.print(f"  [green]   Improvement over best baseline: +{improvement:.4f} AUROC points[/green]")
+            elif improvement > 0:
+                console.print(f"  [yellow]⚠️  TRACER shows modest improvement over best baseline (+{improvement:.4f})[/yellow]")
+            else:
+                console.print(f"  [red]❌ TRACER does not outperform best baseline[/red]")
+                console.print(f"  [yellow]   Best baseline: {best_baseline_name} (AUROC={best_baseline_auroc:.4f})[/yellow]")
+        else:
+            console.print("  [yellow]⚠️  TRACER AUROC not available for comparison[/yellow]")
 
     # Per-simulation summary
     console.print("\n[bold cyan]Per-Simulation Summary[/bold cyan]\n")
@@ -813,9 +1165,9 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
             f"  Mean uncertainty (user):    {summary.get('mean_uncertainty_user', 0):.4f}"
         )
         
-        # Display SAUP score if available
-        if sim.saup_metrics:
-            console.print(f"  SAUP Score: {sim.saup_metrics['saup_score']:.4f}")
+        # Display TRACER score if available
+        if sim.tracer_metrics:
+            console.print(f"  TRACER Score: {sim.tracer_metrics['tracer_score']:.4f}")
             console.print(f"  Ground Truth: {'✅ Pass' if sim.ground_truth_pass else '❌ Fail' if sim.ground_truth_pass is not None else 'N/A'}\n")
         else:
             console.print()
@@ -850,16 +1202,16 @@ def print_detailed_trajectory(
     console.print(f"[bold]Trial:[/bold] {sim.trial}")
     console.print(f"[bold]Total Turns:[/bold] {sim.turn_count}")
     
-    # Display SAUP score if available
-    if sim.saup_metrics:
-        console.print(f"[bold]SAUP Score:[/bold] {sim.saup_metrics['saup_score']:.4f}")
+    # Display TRACER score if available
+    if sim.tracer_metrics:
+        console.print(f"[bold]TRACER Score:[/bold] {sim.tracer_metrics['tracer_score']:.4f}")
         console.print(f"[bold]Ground Truth:[/bold] {'✅ Pass' if sim.ground_truth_pass else '❌ Fail' if sim.ground_truth_pass is not None else 'N/A'}")
     console.print()
 
     # Calculate penalties for display
     penalties = []
-    if sim.saup_metrics:
-        config = SAUPConfig()
+    if sim.tracer_metrics:
+        config = TRACERConfig()
         for score in sim.uncertainty_scores:
             from tau2.metrics.uncertainty import calculate_situational_weight
             penalty = calculate_situational_weight(
@@ -981,10 +1333,10 @@ def main():
         help="Do not save results to file",
     )
     parser.add_argument(
-        "--saup-config",
+        "--tracer-config",
         type=json.loads,
         default='{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.2}',
-        help='SAUP-D weight configuration (JSON format, e.g., \'{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.2}\')',
+        help='TRACER weight configuration (JSON format, e.g., \'{"alpha": 4.0, "beta": 4.0, "gamma": 5.0, "top_k_percentile": 0.26, "ensemble_weight_max": 0.2}\')',
     )
     parser.add_argument(
         "--no-auroc",
@@ -1011,15 +1363,15 @@ def main():
         )
         results = Results.load(sim_path)
 
-        # Parse SAUP configuration from CLI arguments
-        saup_config = SAUPConfig(**args.saup_config)
-        console.print(f"[cyan]⚙️  SAUP Config: α={saup_config.alpha}, β={saup_config.beta}, γ={saup_config.gamma}[/cyan]")
+        # Parse TRACER configuration from CLI arguments
+        tracer_config = TRACERConfig(**args.tracer_config)
+        console.print(f"[cyan]⚙️  TRACER Config: α={tracer_config.alpha}, β={tracer_config.beta}, γ={tracer_config.gamma}[/cyan]")
 
         # Analyze
         console.print("[cyan]🔄 Analyzing trajectories and calculating uncertainty scores...[/cyan]")
         analysis = analyze_results(
             results,
-            config=saup_config,
+            config=tracer_config,
             verbose=args.verbose,
             calculate_auroc=not args.no_auroc
         )
