@@ -23,11 +23,11 @@ from tau2.user.base import BaseUser, is_valid_user_history_message
 from tau2.user.user_simulator import DummyUser, UserSimulator, UserState
 from tau2.metrics.uncertainty import (
     EmbeddingService,
-    SAUPConfig,
+    TRACERConfig,
     calculate_inference_gap,
     calculate_hybrid_repetition_score,
     calculate_tool_repetition,
-    calculate_saup_from_trajectory,
+    calculate_tracer_from_trajectory,
     get_uncertainty_stats,
 )
 from tau2.utils.llm_utils import get_cost
@@ -63,7 +63,7 @@ class Orchestrator:
         seed: Optional[int] = None,
         solo_mode: bool = False,
         calculate_uncertainty: bool = False,
-        saup_config: Optional[SAUPConfig] = None,
+        tracer_config: Optional[TRACERConfig] = None,
     ):
         self.domain = domain
         self.agent = agent
@@ -86,8 +86,8 @@ class Orchestrator:
         self.to_role: Optional[Role] = None
         self.message: Optional[Message] = None
         
-        # SAUP configuration
-        self.saup_config = saup_config if saup_config is not None else SAUPConfig()
+        # TRACER configuration
+        self.tracer_config = tracer_config if tracer_config is not None else TRACERConfig()
         
         # Situational awareness tracking (reuses calculate_uncertainty flag)
         self.calculate_situational_awareness = calculate_uncertainty
@@ -305,20 +305,20 @@ class Orchestrator:
         else:
             agent_cost, user_cost = res
         
-        # Calculate SAUP-D aggregation score if uncertainty is enabled
-        saup_metrics = None
+        # Calculate TRACER aggregation score if uncertainty is enabled
+        tracer_metrics = None
         if self.calculate_uncertainty:
             try:
-                saup_result = calculate_saup_from_trajectory(messages, self.saup_config)
+                tracer_result = calculate_tracer_from_trajectory(messages, self.tracer_config)
                 # Remove penalties list from output (too verbose for JSON)
-                saup_metrics = {k: v for k, v in saup_result.items() if k != 'penalties'}
+                tracer_metrics = {k: v for k, v in tracer_result.items() if k != 'penalties'}
                 logger.info(
-                    f"SAUP-D Score: {saup_metrics['saup_score']:.4f} "
-                    f"(N={saup_metrics['num_steps']}, mean_penalty={saup_metrics['mean_penalty']:.4f})"
+                    f"TRACER Score: {tracer_metrics['tracer_score']:.4f} "
+                    f"(N={tracer_metrics['num_steps']}, mean_penalty={tracer_metrics['mean_penalty']:.4f})"
                 )
             except Exception as e:
-                logger.warning(f"Failed to calculate SAUP score: {e}")
-                saup_metrics = None
+                logger.warning(f"Failed to calculate TRACER score: {e}")
+                tracer_metrics = None
         
         simulation_run = SimulationRun(
             id=str(uuid.uuid4()),
@@ -332,7 +332,7 @@ class Orchestrator:
             agent_cost=agent_cost,
             messages=messages,
             seed=self.seed,
-            saup_metrics=saup_metrics,
+            tracer_metrics=tracer_metrics,
         )
         return simulation_run
 
@@ -371,6 +371,108 @@ class Orchestrator:
         
         return ""
     
+    def _elicit_self_assessed_confidence(self, message: AssistantMessage) -> Optional[float]:
+        """
+        Elicit self-assessed confidence from the agent for its response.
+        
+        Makes a secondary LLM call to ask the agent to rate its confidence
+        in the response it just provided. This is used as a baseline metric
+        for comparison with TRACER.
+        
+        Args:
+            message: The AssistantMessage to elicit confidence for
+            
+        Returns:
+            Optional[float]: Confidence score in [0.0, 1.0], or None if elicitation fails
+        """
+        try:
+            # Format the agent's response for the confidence prompt
+            response_parts = []
+            if message.content:
+                response_parts.append(message.content)
+            if message.tool_calls:
+                for tool_call in message.tool_calls:
+                    tool_str = f"Tool call: {tool_call.name}({tool_call.arguments})"
+                    response_parts.append(tool_str)
+            
+            if not response_parts:
+                logger.debug("No content to elicit confidence for")
+                return None
+            
+            response_text = " | ".join(response_parts)
+            
+            # Construct the confidence elicitation prompt
+            confidence_prompt = f"""You just provided the following response:
+{response_text}
+
+TASK: Rate your confidence that this response is correct, helpful, and will successfully address the user's need.
+
+IMPORTANT: Be honest and precise. Overconfidence is harmful. Consider:
+- Do you have all necessary information to answer correctly?
+- Are there any ambiguities or assumptions in your response?
+- Could there be alternative interpretations or solutions?
+- Are you making any tool calls without being certain of the parameters?
+- Is the user's request clear, or are you inferring their intent?
+
+Report your confidence as a single number from 0.0 to 1.0:
+- 1.0 = Completely certain: You have all information and the response is definitively correct
+- 0.8 = High confidence: Very likely correct, minor uncertainty about edge cases
+- 0.6 = Moderate confidence: Probably correct, but noticeable uncertainty or assumptions
+- 0.4 = Low confidence: Significant uncertainty, multiple possible interpretations
+- 0.2 = Very uncertain: Guessing or lacking critical information
+- 0.0 = No confidence: Cannot determine if response is appropriate
+
+Be calibrated: If you're unsure, report lower confidence. Accuracy matters more than optimism.
+
+Your confidence score (just the number):"""
+            
+            # Prepare LLM arguments (copy and override specific settings)
+            from copy import deepcopy
+            from tau2.data_model.message import UserMessage as ConfidenceUserMessage
+            from tau2.utils.llm_utils import generate
+            
+            llm_args_copy = deepcopy(self.agent.llm_args)
+            llm_args_copy.update({
+                "temperature": 0.1,
+                "max_tokens": 500,  # Increased to handle longer prompts and prevent truncation
+                "logprobs": False,  # Don't need logprobs for confidence query
+            })
+            
+            # Make the secondary LLM call
+            confidence_message = generate(
+                model=self.agent.llm,
+                messages=[ConfidenceUserMessage(role="user", content=confidence_prompt)],
+                tools=None,  # No tools needed for this query
+                **llm_args_copy
+            )
+            
+            # Parse the response
+            if not confidence_message.content:
+                logger.debug("Empty response from confidence elicitation (this is non-critical)")
+                return None
+            
+            # Extract float value from response
+            import re
+            confidence_text = confidence_message.content.strip()
+            
+            # Try to extract a number (handles various formats)
+            number_match = re.search(r'(\d+\.?\d*)', confidence_text)
+            if number_match:
+                confidence_value = float(number_match.group(1))
+                
+                # Clamp to [0.0, 1.0]
+                confidence_value = max(0.0, min(1.0, confidence_value))
+                
+                logger.debug(f"Elicited self-assessed confidence: {confidence_value:.4f}")
+                return confidence_value
+            else:
+                logger.debug(f"Could not parse confidence value from response: {confidence_text[:50]}...")
+                return None
+                
+        except Exception as e:
+            logger.debug(f"Confidence elicitation failed (non-critical): {e}")
+            return None
+    
     def _calculate_and_attach_metrics(
         self, message: Message
     ) -> None:
@@ -403,6 +505,16 @@ class Orchestrator:
                 f"U_i={uncertainty_stats.normalized_entropy:.4f} "
                 f"(tokens={uncertainty_stats.token_count})"
             )
+        
+        # Elicit self-assessed confidence for AGENT messages
+        # This is a baseline metric for comparison with TRACER
+        if isinstance(message, AssistantMessage):
+            confidence = self._elicit_self_assessed_confidence(message)
+            if message.uncertainty is None:
+                message.uncertainty = {}
+            message.uncertainty['self_assessed_confidence'] = confidence
+            if confidence is not None:
+                logger.debug(f"Self-assessed confidence: {confidence:.4f}")
         
         # Calculate semantic distance metrics if situational awareness enabled
         if self.calculate_situational_awareness and self.embedding_service:
