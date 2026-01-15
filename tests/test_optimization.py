@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Quick test script to verify the optimized SAUP parameter search works correctly.
+Quick test script to verify the optimized TRACER parameter search works correctly.
 
 This script runs a small-scale optimization to validate:
 1. Pre-computation phase completes successfully
@@ -17,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from rich.console import Console
 from tau2.data_model.simulation import Results
-from tau2.metrics.uncertainty import SAUPConfig
-from tau2.scripts.optimize_saup_parameters import (
+from tau2.metrics.uncertainty import TRACERConfig
+from tau2.scripts.optimize_tracer_parameters import (
     precompute_step_metrics,
     evaluate_config_fast,
     evaluate_config,
@@ -30,7 +30,7 @@ def test_optimization(sim_path: Path):
     """Test the optimized parameter search on a real dataset."""
     console = Console()
     
-    console.print("[bold cyan]Testing Optimized SAUP Parameter Search[/bold cyan]\n")
+    console.print("[bold cyan]Testing Optimized TRACER Parameter Search[/bold cyan]\n")
     
     # Load data
     console.print("1. Loading simulation data...")
@@ -41,9 +41,9 @@ def test_optimization(sim_path: Path):
     
     # Test configurations (small sample)
     test_configs = [
-        SAUPConfig(alpha=3.0, beta=4.0, gamma=5.0, top_k_percentile=0.25, ensemble_weight_max=0.15),
-        SAUPConfig(alpha=4.0, beta=4.0, gamma=5.0, top_k_percentile=0.26, ensemble_weight_max=0.2),
-        SAUPConfig(alpha=5.0, beta=5.0, gamma=6.0, top_k_percentile=0.3, ensemble_weight_max=0.15),
+        TRACERConfig(alpha=3.0, beta=4.0, gamma=5.0, top_k_percentile=0.25, ensemble_weight_max=0.15),
+        TRACERConfig(alpha=4.0, beta=4.0, gamma=5.0, top_k_percentile=0.26, ensemble_weight_max=0.2),
+        TRACERConfig(alpha=5.0, beta=5.0, gamma=6.0, top_k_percentile=0.3, ensemble_weight_max=0.15),
     ]
     
     # Pre-computation phase
