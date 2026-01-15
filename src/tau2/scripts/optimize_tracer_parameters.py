@@ -1,8 +1,10 @@
 """
-TRACER Parameter Optimization Script
+TRACER Parameter Optimization Script (MAX Variant)
 
 Systematically searches for optimal TRACER parameters (alpha, beta, gamma, 
 top_k_percentile, ensemble_weight_max) that maximize AUROC for failure prediction.
+
+Uses MAX variant formula: risk_i = max(U_i, α·Da_i, β·Do_agent_i, γ·Do_user_i)
 
 This script implements a multi-stage grid search strategy:
 1. Coarse Grid Search: Explores wide parameter ranges to find promising regions
@@ -324,7 +326,7 @@ def evaluate_config_fast(
     Phase 2: Fast evaluation using pre-computed step metrics.
     
     This function only performs the lightweight arithmetic operations:
-    - step_risk = U_i + alpha*Da + beta*Do_agent + gamma*Do_user
+    - step_risk = max(U_i, alpha*Da, beta*Do_agent, gamma*Do_user)  [MAX variant]
     - top-k filtering
     - ensemble aggregation
     - AUROC calculation
@@ -357,7 +359,7 @@ def evaluate_config_fast(
             if ground_truth_pass is None or not steps:
                 continue
             
-            # Calculate step risks using simple arithmetic
+            # Calculate step risks using MAX variant formula
             step_risks = []
             for step in steps:
                 ui = step['ui']
@@ -365,9 +367,13 @@ def evaluate_config_fast(
                 do_agent = step['do_agent'] if step['do_agent'] is not None else 0.0
                 do_user = step['do_user'] if step['do_user'] is not None else 0.0
                 
-                # Additive formula: risk = U_i + alpha*Da + beta*Do_agent + gamma*Do_user
-                penalty = config.alpha * da + config.beta * do_agent + config.gamma * do_user
-                step_risk = ui + penalty
+                # MAX formula: risk = max(U_i, alpha*Da, beta*Do_agent, gamma*Do_user)
+                step_risk = max(
+                    ui,
+                    config.alpha * da,
+                    config.beta * do_agent,
+                    config.gamma * do_user
+                )
                 step_risks.append(step_risk)
             
             if not step_risks:
@@ -468,12 +474,15 @@ def coarse_grid_search(
     """
     Stage 1: Coarse grid search over wide parameter ranges.
     
-    Search space:
-        - alpha: [3, 4, 5, 6, 7, 8, 10, 12, 15]
-        - beta: [3, 4, 5, 6, 7]
-        - gamma: [3, 4, 5, 6, 7]
-        - top_k_percentile: [0.2, 0.25, 0.3, 0.35, 0.4]
-        - ensemble_weight_max: fixed at 0.15
+    Search space (updated to include 0.0 for all parameters):
+        - alpha: [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+        - beta: [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+        - gamma: [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+        - top_k_percentile: [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
+        - ensemble_weight_max: [0.0, 0.1, 0.2, 0.3]
+    
+    Note: Including 0.0 is critical as diagnostic analysis showed that
+    α=0.0 and γ=0.0 are often optimal (disabling Da and Do_user penalties).
     
     Args:
         merged_results: Merged simulation results (used only if precomputed_data is None)
@@ -483,13 +492,13 @@ def coarse_grid_search(
     Returns:
         Dictionary with best configuration and results
     """
-    alpha_values = [2, 3, 4, 5, 6, 7, 8, 10, 12, 15]
-    beta_values = [3, 4, 5, 6, 7]
-    gamma_values = [2, 3, 4, 5, 6, 7]
-    topk_values = [0.2, 0.25, 0.3, 0.35, 0.4]
-    ensemble_value = 0.15  # Fixed for coarse search
+    alpha_values = [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+    beta_values = [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+    gamma_values = [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+    topk_values = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
+    ensemble_values = [0.0, 0.1, 0.2, 0.3]
     
-    configs = list(itertools.product(alpha_values, beta_values, gamma_values, topk_values))
+    configs = list(itertools.product(alpha_values, beta_values, gamma_values, topk_values, ensemble_values))
     total_configs = len(configs)
     
     console.print(f"\n[bold cyan]Stage 1: Coarse Grid Search[/bold cyan]")
@@ -498,7 +507,7 @@ def coarse_grid_search(
     console.print(f"  Beta: {len(beta_values)} values")
     console.print(f"  Gamma: {len(gamma_values)} values")
     console.print(f"  Top-K: {len(topk_values)} values")
-    console.print(f"  Ensemble: {ensemble_value} (fixed)\n")
+    console.print(f"  Ensemble: {len(ensemble_values)} values\n")
     
     results = []
     
@@ -512,13 +521,13 @@ def coarse_grid_search(
     ) as progress:
         task = progress.add_task("Optimizing...", total=total_configs)
         
-        for alpha, beta, gamma, topk in configs:
+        for alpha, beta, gamma, topk, ensemble in configs:
             config = TRACERConfig(
                 alpha=alpha,
                 beta=beta,
                 gamma=gamma,
                 top_k_percentile=topk,
-                ensemble_weight_max=ensemble_value
+                ensemble_weight_max=ensemble
             )
             
             # Use fast evaluation if precomputed data available, otherwise fall back to legacy
@@ -534,7 +543,7 @@ def coarse_grid_search(
                         'beta': beta,
                         'gamma': gamma,
                         'top_k_percentile': topk,
-                        'ensemble_weight_max': ensemble_value
+                        'ensemble_weight_max': ensemble
                     },
                     'auroc': auroc
                 })
@@ -696,13 +705,13 @@ def fine_grained_search(
     Returns:
         Dictionary with best configuration and results
     """
-    # Generate alpha values
-    alpha_min = alpha_center - alpha_range
+    # Generate alpha values (ensure non-negative)
+    alpha_min = max(0.0, alpha_center - alpha_range)
     alpha_max = alpha_center + alpha_range
     alpha_values = np.arange(alpha_min, alpha_max + alpha_step, alpha_step).tolist()
     
-    # Generate top_k values
-    topk_min = max(0.1, topk_center - topk_range)
+    # Generate top_k values (ensure valid range [0.05, 1.0])
+    topk_min = max(0.05, topk_center - topk_range)
     topk_max = min(1.0, topk_center + topk_range)
     topk_values = np.arange(topk_min, topk_max + topk_step, topk_step).tolist()
     
