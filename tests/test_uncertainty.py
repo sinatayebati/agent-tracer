@@ -1,7 +1,7 @@
 """
 Unit tests for uncertainty metrics module.
 
-Tests the SAUP framework uncertainty calculation functions including:
+Tests the TRACER framework uncertainty calculation functions including:
 - Normalized entropy calculation
 - Edge case handling
 - Token-level uncertainties

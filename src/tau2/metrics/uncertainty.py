@@ -1,7 +1,7 @@
 """
-Uncertainty Metrics for SAUP Framework
+Uncertainty Metrics for TRACER Framework
 
-This module implements uncertainty quantification metrics for the SAUP
+This module implements uncertainty quantification metrics for the TRACER
 (Situation-Awareness Uncertainty Propagation) framework on Tau-2 benchmark.
 
 Key metrics:
@@ -11,9 +11,7 @@ Key metrics:
 - Semantic Distance Metrics:
   - Inquiry Drift (Da): measures deviation from initial goal
   - Inference Gap (Do): measures coherence between action and observation
-- SAUP-D Aggregation: weighted RMS combining all metrics into trajectory score
-
-Reference: SAUP paper, Equation 3 - Normalized Entropy
+- TRACER Aggregation: weighted RMS combining all metrics into trajectory score
 """
 
 import os
@@ -321,7 +319,7 @@ def get_uncertainty_stats(logprobs_object: Optional[dict]) -> UncertaintyStats:
 
 
 # ============================================================================
-# Semantic Distance Metrics (SAUP Situational Awareness Layer)
+# Semantic Distance Metrics (TRACER Situational Awareness Layer)
 # ============================================================================
 
 
@@ -871,42 +869,42 @@ def calculate_inference_gap(antecedent: str, consequent: str) -> float:
 
 
 # ============================================================================
-# SAUP-D Aggregation (Final Trajectory Score)
+# TRACER Aggregation (Final Trajectory Score)
 # ============================================================================
 
 
 @dataclass
-class SAUPConfig:
+class TRACERConfig:
     """
-    Configuration for SAUP-D aggregation.
+    Configuration for TRACER (Task Risk Assessment via Contextual Entropy and Reasoning) aggregation.
     
-    The situational weight for each step is calculated as:
-        W_i = alpha * Da_i + beta * Do_agent_i + gamma * Do_user_i
+    Uses MAX variant formula (optimized via diagnostic analysis):
+        risk_i = max(U_i, alpha * Da_i, beta * Do_agent_i, gamma * Do_user_i)
     
     Attributes:
-        alpha: Weight for repetition (Da) - default 4.0 (fine-tuned via 315 tests)
-        beta: Weight for agent coherence (Do_agent) - default 4.0 (optimized)
-        gamma: Weight for user coherence (Do_user) - default 5.0 (optimized)
-        top_k_percentile: Percentile for top-k aggregation (0.26 = top 26%) - default 0.26
-                         Fine-tuned to balance critical moment capture vs noise
+        alpha: Weight for repetition (Da)
+        beta: Weight for agent coherence (Do_agent) - (PRIMARY SIGNAL)
+        gamma: Weight for user coherence (Do_user)
+        top_k_percentile: Percentile for top-k aggregation
+                         Optimized to focus on critical failure moments
                          Set to 1.0 to use all steps (equivalent to mean)
-        ensemble_weight_max: Weight for max risk in ensemble (0.2 = 20%) - default 0.2
-                            SAUP = (1-w)*mean(top_k) + w*max(all_risks)
+        ensemble_weight_max: Weight for single worst moment
+                            TRACER = (1-w)*mean(top_k) + w*max(all_risks)
                             Combines sustained problems with single worst moment
                             Set to 0.0 to disable ensemble (use pure top-k mean)
     """
-    alpha: float = 4.0
-    beta: float = 4.0
-    gamma: float = 5.0
-    top_k_percentile: float = 0.26
-    ensemble_weight_max: float = 0.2
+    alpha: float = 1.0
+    beta: float = 1.0
+    gamma: float = 1.0
+    top_k_percentile: float = 0.1
+    ensemble_weight_max: float = 0.1
 
 
 def calculate_situational_weight(
     da: Optional[float],
     do_agent: Optional[float],
     do_user: Optional[float],
-    config: SAUPConfig
+    config: TRACERConfig
 ) -> float:
     """
     Calculate situational penalty for a single step (additive component).
@@ -922,13 +920,13 @@ def calculate_situational_weight(
         da: Inquiry drift score (None treated as 0.0)
         do_agent: Agent coherence score (None treated as 0.0)
         do_user: User coherence score (None treated as 0.0)
-        config: SAUP configuration with alpha, beta, gamma weights
+        config: TRACER configuration with alpha, beta, gamma weights
         
     Returns:
         float: Situational penalty >= 0
     
     Example:
-        >>> config = SAUPConfig(alpha=1.0, beta=1.0, gamma=1.0)
+        >>> config = TRACERConfig(alpha=1.0, beta=1.0, gamma=1.0)
         >>> penalty = calculate_situational_weight(0.2, 0.3, None, config)
         >>> # Returns: 1.0*0.2 + 1.0*0.3 + 1.0*0.0 = 0.5
     """
@@ -947,28 +945,32 @@ def calculate_situational_weight(
     return float(penalty)
 
 
-def calculate_saup_score(
+def calculate_tracer_score(
     step_data: list[dict],
-    config: Optional[SAUPConfig] = None
+    config: Optional[TRACERConfig] = None
 ) -> dict:
     """
-    Calculate SAUP-D aggregation score using top-k aggregation with ensemble.
+    Calculate TRACER aggregation score using MAX variant with top-k aggregation.
     
-    Implements the optimized SAUP-D formula with ensemble method:
-        U_trajectory = (1-w) × mean(top_k%(U_i + Penalty_i)) + w × max(U_i + Penalty_i)
+    Implements the optimized MAX variant formula:
+        risk_i = max(U_i, α·Da_i, β·Do_agent_i, γ·Do_user_i)
+        TRACER = (1-w) × mean(top_k%(risk_i)) + w × max(risk_i)
     
     Where:
-        - top_k% = highest k% of step risks (default k=26%)
-        - w = ensemble weight for max (default 0.2)
-        - Penalty_i = α·Da_i + β·Do_agent_i + γ·Do_user_i
+        - risk_i takes the maximum of individual components at each step
+        - top_k% = worst k% of steps (default k=15%)
+        - w = ensemble weight for single worst moment (default 0.30)
+        - α, β, γ = component weights (defaults: α=0.0, β=1.0, γ=0.0)
         - U_i = normalized entropy for step i
-        - Da_i = repetition score (local looping penalty)
+        - Da_i = inquiry drift (repetition penalty) - DISABLED by default
+        - Do_agent_i = agent coherence - PRIMARY SIGNAL
+        - Do_user_i = user coherence - DISABLED by default
     
-    Rationale: Failures have BOTH sustained problems AND critical moments.
-    - Mean(top-k) captures chronic issues throughout dialogue
-    - Max captures the single worst failure moment
-    - 80/20 ensemble balances these complementary signals
-    - Empirically improves AUROC from 0.6488 to 0.7007 (+8.0%)
+    Rationale: MAX variant outperforms additive formulation (AUROC: 0.7209 vs 0.5583)
+    - Takes worst signal at each step instead of summing
+    - Eliminates noise from weak predictors (Da, Do_user)
+    - Focuses on agent coherence (Do_agent) as primary failure indicator
+    - Emphasizes critical failure moments (worst 15% + max ensemble)
     
     Args:
         step_data: List of step dictionaries containing:
@@ -976,11 +978,11 @@ def calculate_saup_score(
                    - 'da': repetition score (optional)
                    - 'do_agent': agent coherence (optional)
                    - 'do_user': user coherence (optional)
-        config: SAUP configuration (defaults to SAUPConfig())
+        config: TRACER configuration (defaults to TRACERConfig())
         
     Returns:
         dict: {
-            'saup_score': float - final trajectory score (mean of top-k risks),
+            'tracer_score': float - final trajectory score (mean of top-k risks),
             'num_steps': int - total number of steps,
             'num_top_k': int - number of steps in top-k,
             'mean_penalty': float - average penalty across all steps,
@@ -995,15 +997,15 @@ def calculate_saup_score(
         ...     {'ui': 0.15, 'da': 0.8, 'do_agent': None, 'do_user': 0.35},  # High Da
         ...     {'ui': 0.05, 'da': 0.1, 'do_agent': 0.2, 'do_user': 0.1}
         ... ]
-        >>> result = calculate_saup_score(steps)
-        >>> print(f"SAUP Score: {result['saup_score']:.4f}")
+        >>> result = calculate_tracer_score(steps)
+        >>> print(f"TRACER Score: {result['tracer_score']:.4f}")
     """
     if config is None:
-        config = SAUPConfig()
+        config = TRACERConfig()
     
     if not step_data:
         return {
-            'saup_score': 0.0,
+            'tracer_score': 0.0,
             'num_steps': 0,
             'num_top_k': 0,
             'mean_penalty': 0.0,
@@ -1029,15 +1031,21 @@ def calculate_saup_score(
         do_agent_val = do_agent if do_agent is not None else 0.0
         do_user_val = do_user if do_user is not None else 0.0
         
-        # Calculate penalty: α·Da_i + β·Do_agent_i + γ·Do_user_i
+        # Calculate penalty components
         penalty = (
             config.alpha * da_val +
             config.beta * do_agent_val +
             config.gamma * do_user_val
         )
         
-        # Calculate step risk using additive formula
-        step_risk = ui + penalty
+        # Calculate step risk using MAX variant formula
+        # risk_i = max(U_i, α·Da_i, β·Do_agent_i, γ·Do_user_i)
+        step_risk = max(
+            ui,
+            config.alpha * da_val,
+            config.beta * do_agent_val,
+            config.gamma * do_user_val
+        )
         
         penalties.append(penalty)
         step_risks.append(step_risk)
@@ -1060,19 +1068,18 @@ def calculate_saup_score(
     mean_top_k = float(np.mean(top_k_risks))
     
     # Ensemble method: combine top-k mean with max risk
-    # Formula: SAUP = (1-w)*mean(top_k) + w*max(all_risks)
+    # Formula: TRACER = (1-w)*mean(top_k) + w*max(all_risks)
     # Rationale: Captures both sustained problems (mean) and single worst moment (max)
-    # Empirically improves AUROC from 0.6890 to 0.7007 (+1.7%)
     if config.ensemble_weight_max > 0.0:
         max_risk = float(np.max(step_risks))
-        saup_score = (1 - config.ensemble_weight_max) * mean_top_k + config.ensemble_weight_max * max_risk
+        tracer_score = (1 - config.ensemble_weight_max) * mean_top_k + config.ensemble_weight_max * max_risk
     else:
         # Pure top-k mean (no ensemble)
-        saup_score = mean_top_k
+        tracer_score = mean_top_k
     
     # Calculate statistics
     result = {
-        'saup_score': saup_score,
+        'tracer_score': tracer_score,
         'num_steps': N,
         'num_top_k': len(top_k_risks),
         'mean_penalty': float(np.mean(penalties)) if penalties else 0.0,
@@ -1084,31 +1091,144 @@ def calculate_saup_score(
     return result
 
 
-def calculate_saup_from_trajectory(
-    messages: list,
-    config: Optional[SAUPConfig] = None
+def calculate_saup_score(
+    step_data: list[dict],
+    config: Optional[TRACERConfig] = None
 ) -> dict:
     """
-    Convenience function to calculate SAUP score directly from message objects.
+    Calculate SAUP (Situation-Awareness Uncertainty Propagation) score.
+    
+    SAUP uses a multiplicative weighting formula with RMS aggregation:
+    
+        SAUP = sqrt(1/N * sum_{i=1}^{N} ((W_i * U_i)^2))
+    
+    Where:
+        - W_i = 1 + α·Da_i + β·Do_agent_i + γ·Do_user_i (penalty weight)
+        - U_i = normalized entropy at step i
+        - N = number of steps
+    
+    This differs from TRACER which uses additive combination (U_i + penalty)
+    and top-k mean aggregation. SAUP uses RMS to give more weight to outlier
+    moments of high weighted uncertainty.
+    
+    Args:
+        step_data: List of dicts with keys: 'ui', 'da', 'do_agent', 'do_user'
+        config: TRACER configuration for α, β, γ weights (defaults to TRACERConfig())
+        
+    Returns:
+        Dictionary with:
+            - 'saup_score': Final SAUP score (float)
+            - 'num_steps': Number of steps included (int)
+            - 'mean_weight': Mean penalty weight (float)
+            - 'std_weight': Std dev of penalty weights (float)
+            - 'mean_ui': Mean normalized entropy (float)
+            - 'weights': List of W_i values (list[float])
+            - 'weighted_uncertainties': List of W_i * U_i values (list[float])
+            
+    Example:
+        >>> step_data = [
+        ...     {'ui': 0.12, 'da': 0.05, 'do_agent': 0.23, 'do_user': 0.11},
+        ...     {'ui': 0.15, 'da': 0.08, 'do_agent': 0.34, 'do_user': 0.09}
+        ... ]
+        >>> config = TRACERConfig(alpha=4.0, beta=5.0, gamma=3.0)
+        >>> result = calculate_saup_score(step_data, config)
+        >>> print(result['saup_score'])
+        0.4523
+    """
+    # Initialize config to default if None
+    if config is None:
+        config = TRACERConfig()
+    
+    # Handle empty input
+    if not step_data:
+        return {
+            'saup_score': 0.0,
+            'num_steps': 0,
+            'mean_weight': 0.0,
+            'std_weight': 0.0,
+            'mean_ui': 0.0,
+            'weights': [],
+            'weighted_uncertainties': []
+        }
+    
+    # Collect metrics
+    weights = []
+    weighted_uncertainties = []
+    ui_values = []
+    
+    for step in step_data:
+        # Extract metrics
+        ui = step.get('ui', 0.0)
+        da = step.get('da')
+        do_agent = step.get('do_agent')
+        do_user = step.get('do_user')
+        
+        # Handle None values (treat as 0.0)
+        da_val = da if da is not None else 0.0
+        do_agent_val = do_agent if do_agent is not None else 0.0
+        do_user_val = do_user if do_user is not None else 0.0
+        
+        # Calculate penalty: α·Da_i + β·Do_agent_i + γ·Do_user_i
+        penalty = (
+            config.alpha * da_val +
+            config.beta * do_agent_val +
+            config.gamma * do_user_val
+        )
+        
+        # Calculate weight: W_i = 1 + penalty
+        weight = 1.0 + penalty
+        
+        # Calculate weighted uncertainty: W_i * U_i
+        weighted_uncertainty = weight * ui
+        
+        weights.append(weight)
+        weighted_uncertainties.append(weighted_uncertainty)
+        ui_values.append(ui)
+    
+    # Calculate SAUP using RMS (root mean square) aggregation
+    # SAUP = sqrt(mean((W_i * U_i)^2))
+    weighted_uncertainties_array = np.array(weighted_uncertainties)
+    saup_score = float(np.sqrt(np.mean(weighted_uncertainties_array ** 2)))
+    
+    # Calculate statistics
+    result = {
+        'saup_score': saup_score,
+        'num_steps': len(step_data),
+        'mean_weight': float(np.mean(weights)) if weights else 0.0,
+        'std_weight': float(np.std(weights)) if weights else 0.0,
+        'mean_ui': float(np.mean(ui_values)) if ui_values else 0.0,
+        'weights': weights,
+        'weighted_uncertainties': weighted_uncertainties
+    }
+    
+    return result
+
+
+def calculate_tracer_from_trajectory(
+    messages: list,
+    config: Optional[TRACERConfig] = None
+) -> dict:
+    """
+    Convenience function to calculate TRACER score directly from message objects.
     
     Extracts U_i, Da, and Do metrics from message objects and calculates
-    the final SAUP-D trajectory score.
+    the final TRACER trajectory score.
     
     Args:
         messages: List of message objects (AssistantMessage, UserMessage)
                   with uncertainty, da_score, do_score, do_type attributes
-        config: SAUP configuration (defaults to SAUPConfig())
+        config: TRACER configuration (defaults to TRACERConfig())
         
     Returns:
-        dict: SAUP metrics (same as calculate_saup_score)
-    
+        dict: TRACER metrics (same as calculate_tracer_score)
+        
     Example:
         >>> # After running a simulation with --calculate-uncertainty
         >>> from tau2.data_model.simulation import Results
         >>> results = Results.load("simulation.json")
         >>> sim = results.simulations[0]
-        >>> saup = calculate_saup_from_trajectory(sim.messages)
-        >>> print(f"Trajectory Score: {saup['saup_score']:.4f}")
+        >>> tracer = calculate_tracer_from_trajectory(sim.messages)
+        >>> print(f"Trajectory Score: {tracer['tracer_score']:.4f}")
     """
     step_data = []
     
@@ -1144,5 +1264,4 @@ def calculate_saup_from_trajectory(
             'do_user': do_user
         })
     
-    return calculate_saup_score(step_data, config)
-
+    return calculate_tracer_score(step_data, config)

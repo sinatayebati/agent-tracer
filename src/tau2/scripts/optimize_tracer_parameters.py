@@ -1,8 +1,10 @@
 """
-SAUP Parameter Optimization Script
+TRACER Parameter Optimization Script (MAX Variant)
 
-Systematically searches for optimal SAUP-D parameters (alpha, beta, gamma, 
+Systematically searches for optimal TRACER parameters (alpha, beta, gamma, 
 top_k_percentile, ensemble_weight_max) that maximize AUROC for failure prediction.
+
+Uses MAX variant formula: risk_i = max(U_i, α·Da_i, β·Do_agent_i, γ·Do_user_i)
 
 This script implements a multi-stage grid search strategy:
 1. Coarse Grid Search: Explores wide parameter ranges to find promising regions
@@ -19,43 +21,43 @@ filename as the input file for easy cross-referencing.
 Usage:
     # AUTO MODE (Recommended): Run all 3 stages sequentially
     # Results auto-save to data/optimization/my_simulation_results.json
-    python -m tau2.scripts.optimize_saup_parameters \\
+    python -m tau2.scripts.optimize_tracer_parameters \\
         data/simulations/my_simulation_results.json
     
     # Or using a directory of simulation files
-    python -m tau2.scripts.optimize_saup_parameters data/simulations/
+    python -m tau2.scripts.optimize_tracer_parameters data/simulations/
     
     # Custom output location
-    python -m tau2.scripts.optimize_saup_parameters \\
+    python -m tau2.scripts.optimize_tracer_parameters \\
         data/simulations/my_simulation_results.json \\
         --output results/custom_optimization.json
     
     # Don't save, just display results
-    python -m tau2.scripts.optimize_saup_parameters \\
+    python -m tau2.scripts.optimize_tracer_parameters \\
         data/simulations/my_simulation_results.json \\
         --no-save
     
     # Stage 1: Coarse grid search only
-    python -m tau2.scripts.optimize_saup_parameters \\
+    python -m tau2.scripts.optimize_tracer_parameters \\
         data/simulations/my_simulation_results.json \\
         --mode coarse
     
     # Stage 2: Fine-grained search (around best coarse params)
-    python -m tau2.scripts.optimize_saup_parameters \\
+    python -m tau2.scripts.optimize_tracer_parameters \\
         data/simulations/my_simulation_results.json \\
         --mode fine \\
         --alpha-center 7.0 --alpha-range 3.0 --alpha-step 0.5 \\
         --topk-center 0.25 --topk-range 0.1 --topk-step 0.01
     
     # Stage 3: Ensemble optimization
-    python -m tau2.scripts.optimize_saup_parameters \\
+    python -m tau2.scripts.optimize_tracer_parameters \\
         data/simulations/my_simulation_results.json \\
         --mode ensemble \\
         --alpha 4.0 --beta 4.0 --gamma 5.0 --top-k 0.26 \\
         --ensemble-weights 0.05 0.1 0.15 0.2 0.25 0.3
     
     # Custom grid search
-    python -m tau2.scripts.optimize_saup_parameters \\
+    python -m tau2.scripts.optimize_tracer_parameters \\
         data/simulations/my_simulation_results.json \\
         --mode custom \\
         --alpha-values 3.0 4.0 5.0 \\
@@ -63,6 +65,18 @@ Usage:
         --gamma-values 4.0 5.0 6.0 \\
         --topk-values 0.2 0.25 0.3 \\
         --ensemble-values 0.15 0.2 0.25
+    
+    # Random search (explore parameter space randomly - good for global optima)
+    python -m tau2.scripts.optimize_tracer_parameters \\
+        data/simulations/my_simulation_results.json \\
+        --mode random \\
+        --n-random 1000
+    
+    # Wide search (broad grid + random exploration - most thorough)
+    python -m tau2.scripts.optimize_tracer_parameters \\
+        data/simulations/my_simulation_results.json \\
+        --mode wide \\
+        --n-random 1000
 
 Example Output (Auto Mode):
     Stage 1 (Coarse):   AUROC = 0.6856 (1125 configs)
@@ -98,7 +112,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRe
 from rich.table import Table
 
 from tau2.data_model.simulation import Results
-from tau2.metrics.uncertainty import SAUPConfig, calculate_normalized_entropy
+from tau2.metrics.uncertainty import TRACERConfig, calculate_normalized_entropy
 from tau2.scripts.analyze_uncertainty import analyze_results, calculate_auroc_metrics
 
 try:
@@ -107,6 +121,8 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
     logger.warning("scikit-learn not available. AUROC evaluation will be disabled.")
+
+import random
 
 
 def load_simulations_from_path(sim_path: Path) -> list[Results]:
@@ -302,7 +318,7 @@ def precompute_step_metrics(merged_results: Results, console: Console) -> list[d
 
 
 def evaluate_config_fast(
-    config: SAUPConfig,
+    config: TRACERConfig,
     precomputed_data: list[dict],
     verbose: bool = False
 ) -> Optional[float]:
@@ -310,7 +326,7 @@ def evaluate_config_fast(
     Phase 2: Fast evaluation using pre-computed step metrics.
     
     This function only performs the lightweight arithmetic operations:
-    - step_risk = U_i + alpha*Da + beta*Do_agent + gamma*Do_user
+    - step_risk = max(U_i, alpha*Da, beta*Do_agent, gamma*Do_user)  [MAX variant]
     - top-k filtering
     - ensemble aggregation
     - AUROC calculation
@@ -318,7 +334,7 @@ def evaluate_config_fast(
     No expensive operations (embeddings, entropy calculations) are performed here.
     
     Args:
-        config: SAUP configuration to evaluate
+        config: TRACER configuration to evaluate
         precomputed_data: Pre-computed step metrics from Phase 1
         verbose: If True, print detailed logs
         
@@ -331,7 +347,7 @@ def evaluate_config_fast(
         return None
     
     try:
-        # Calculate SAUP scores for each simulation
+        # Calculate TRACER scores for each simulation
         y_scores = []
         y_true = []
         
@@ -343,7 +359,7 @@ def evaluate_config_fast(
             if ground_truth_pass is None or not steps:
                 continue
             
-            # Calculate step risks using simple arithmetic
+            # Calculate step risks using MAX variant formula
             step_risks = []
             for step in steps:
                 ui = step['ui']
@@ -351,9 +367,13 @@ def evaluate_config_fast(
                 do_agent = step['do_agent'] if step['do_agent'] is not None else 0.0
                 do_user = step['do_user'] if step['do_user'] is not None else 0.0
                 
-                # Additive formula: risk = U_i + alpha*Da + beta*Do_agent + gamma*Do_user
-                penalty = config.alpha * da + config.beta * do_agent + config.gamma * do_user
-                step_risk = ui + penalty
+                # MAX formula: risk = max(U_i, alpha*Da, beta*Do_agent, gamma*Do_user)
+                step_risk = max(
+                    ui,
+                    config.alpha * da,
+                    config.beta * do_agent,
+                    config.gamma * do_user
+                )
                 step_risks.append(step_risk)
             
             if not step_risks:
@@ -373,12 +393,12 @@ def evaluate_config_fast(
             # Ensemble: combine top-k mean with max risk
             if config.ensemble_weight_max > 0.0:
                 max_risk = float(np.max(step_risks))
-                saup_score = (1 - config.ensemble_weight_max) * mean_top_k + config.ensemble_weight_max * max_risk
+                tracer_score = (1 - config.ensemble_weight_max) * mean_top_k + config.ensemble_weight_max * max_risk
             else:
-                saup_score = mean_top_k
+                tracer_score = mean_top_k
             
             # Store for AUROC calculation
-            y_scores.append(saup_score)
+            y_scores.append(tracer_score)
             # Label encoding: Failure=1, Success=0
             y_true.append(0 if ground_truth_pass else 1)
         
@@ -407,7 +427,7 @@ def evaluate_config_fast(
 
 
 def evaluate_config(
-    config: SAUPConfig,
+    config: TRACERConfig,
     merged_results: Results,
     verbose: bool = False
 ) -> Optional[float]:
@@ -418,7 +438,7 @@ def evaluate_config(
     For optimization, use precompute_step_metrics() + evaluate_config_fast() instead.
     
     Args:
-        config: SAUP configuration to evaluate
+        config: TRACER configuration to evaluate
         merged_results: Merged simulation results
         verbose: If True, print detailed logs
         
@@ -454,12 +474,15 @@ def coarse_grid_search(
     """
     Stage 1: Coarse grid search over wide parameter ranges.
     
-    Search space:
-        - alpha: [3, 4, 5, 6, 7, 8, 10, 12, 15]
-        - beta: [3, 4, 5, 6, 7]
-        - gamma: [3, 4, 5, 6, 7]
-        - top_k_percentile: [0.2, 0.25, 0.3, 0.35, 0.4]
-        - ensemble_weight_max: fixed at 0.15
+    Search space (updated to include 0.0 for all parameters):
+        - alpha: [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+        - beta: [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+        - gamma: [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+        - top_k_percentile: [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
+        - ensemble_weight_max: [0.0, 0.1, 0.2, 0.3]
+    
+    Note: Including 0.0 is critical as diagnostic analysis showed that
+    α=0.0 and γ=0.0 are often optimal (disabling Da and Do_user penalties).
     
     Args:
         merged_results: Merged simulation results (used only if precomputed_data is None)
@@ -469,13 +492,13 @@ def coarse_grid_search(
     Returns:
         Dictionary with best configuration and results
     """
-    alpha_values = [2, 3, 4, 5, 6, 7, 8, 10, 12, 15]
-    beta_values = [3, 4, 5, 6, 7]
-    gamma_values = [2, 3, 4, 5, 6, 7]
-    topk_values = [0.2, 0.25, 0.3, 0.35, 0.4]
-    ensemble_value = 0.15  # Fixed for coarse search
+    alpha_values = [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+    beta_values = [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+    gamma_values = [0.0, 0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
+    topk_values = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]
+    ensemble_values = [0.0, 0.1, 0.2, 0.3]
     
-    configs = list(itertools.product(alpha_values, beta_values, gamma_values, topk_values))
+    configs = list(itertools.product(alpha_values, beta_values, gamma_values, topk_values, ensemble_values))
     total_configs = len(configs)
     
     console.print(f"\n[bold cyan]Stage 1: Coarse Grid Search[/bold cyan]")
@@ -484,7 +507,7 @@ def coarse_grid_search(
     console.print(f"  Beta: {len(beta_values)} values")
     console.print(f"  Gamma: {len(gamma_values)} values")
     console.print(f"  Top-K: {len(topk_values)} values")
-    console.print(f"  Ensemble: {ensemble_value} (fixed)\n")
+    console.print(f"  Ensemble: {len(ensemble_values)} values\n")
     
     results = []
     
@@ -498,13 +521,13 @@ def coarse_grid_search(
     ) as progress:
         task = progress.add_task("Optimizing...", total=total_configs)
         
-        for alpha, beta, gamma, topk in configs:
-            config = SAUPConfig(
+        for alpha, beta, gamma, topk, ensemble in configs:
+            config = TRACERConfig(
                 alpha=alpha,
                 beta=beta,
                 gamma=gamma,
                 top_k_percentile=topk,
-                ensemble_weight_max=ensemble_value
+                ensemble_weight_max=ensemble
             )
             
             # Use fast evaluation if precomputed data available, otherwise fall back to legacy
@@ -520,7 +543,7 @@ def coarse_grid_search(
                         'beta': beta,
                         'gamma': gamma,
                         'top_k_percentile': topk,
-                        'ensemble_weight_max': ensemble_value
+                        'ensemble_weight_max': ensemble
                     },
                     'auroc': auroc
                 })
@@ -536,6 +559,114 @@ def coarse_grid_search(
         'successful_evaluations': len(results),
         'best_config': results[0]['config'],
         'best_auroc': results[0]['auroc'],
+        'top_10_configs': results[:10]
+    }
+
+
+def random_search(
+    merged_results: Results,
+    console: Console,
+    n_iterations: int = 500,
+    alpha_range: tuple[float, float] = (0.0, 20.0),
+    beta_range: tuple[float, float] = (0.0, 20.0),
+    gamma_range: tuple[float, float] = (0.0, 20.0),
+    topk_range: tuple[float, float] = (0.05, 1.0),
+    ensemble_range: tuple[float, float] = (0.0, 0.5),
+    precomputed_data: Optional[list[dict]] = None,
+    seed: Optional[int] = None
+) -> dict[str, Any]:
+    """
+    Random search over continuous parameter space.
+    
+    Often more effective than grid search for finding global optima because:
+    - Explores diverse regions of parameter space
+    - Not biased by grid structure
+    - Can test extreme parameter combinations
+    
+    Args:
+        merged_results: Merged simulation results
+        console: Rich console for output
+        n_iterations: Number of random configurations to test
+        alpha_range: (min, max) for alpha parameter
+        beta_range: (min, max) for beta parameter
+        gamma_range: (min, max) for gamma parameter  
+        topk_range: (min, max) for top_k_percentile
+        ensemble_range: (min, max) for ensemble_weight_max
+        precomputed_data: Pre-computed step metrics
+        seed: Random seed for reproducibility
+        
+    Returns:
+        Dictionary with best configuration and results
+    """
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+    
+    console.print(f"\n[bold cyan]Random Search[/bold cyan]")
+    console.print(f"Testing {n_iterations} random configurations...")
+    console.print(f"  Alpha: [{alpha_range[0]}, {alpha_range[1]}]")
+    console.print(f"  Beta: [{beta_range[0]}, {beta_range[1]}]")
+    console.print(f"  Gamma: [{gamma_range[0]}, {gamma_range[1]}]")
+    console.print(f"  Top-K: [{topk_range[0]}, {topk_range[1]}]")
+    console.print(f"  Ensemble: [{ensemble_range[0]}, {ensemble_range[1]}]\n")
+    
+    results = []
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        task = progress.add_task("Exploring...", total=n_iterations)
+        
+        for _ in range(n_iterations):
+            # Sample random parameters from uniform distributions
+            alpha = random.uniform(*alpha_range)
+            beta = random.uniform(*beta_range)
+            gamma = random.uniform(*gamma_range)
+            topk = random.uniform(*topk_range)
+            ensemble = random.uniform(*ensemble_range)
+            
+            config = TRACERConfig(
+                alpha=alpha,
+                beta=beta,
+                gamma=gamma,
+                top_k_percentile=topk,
+                ensemble_weight_max=ensemble
+            )
+            
+            # Evaluate
+            if precomputed_data is not None:
+                auroc = evaluate_config_fast(config, precomputed_data)
+            else:
+                auroc = evaluate_config(config, merged_results)
+            
+            if auroc is not None:
+                results.append({
+                    'config': {
+                        'alpha': alpha,
+                        'beta': beta,
+                        'gamma': gamma,
+                        'top_k_percentile': topk,
+                        'ensemble_weight_max': ensemble
+                    },
+                    'auroc': auroc
+                })
+            
+            progress.update(task, advance=1)
+    
+    # Sort by AUROC
+    results.sort(key=lambda x: x['auroc'], reverse=True)
+    
+    return {
+        'mode': 'random',
+        'total_configurations': n_iterations,
+        'successful_evaluations': len(results),
+        'best_config': results[0]['config'] if results else None,
+        'best_auroc': results[0]['auroc'] if results else None,
         'top_10_configs': results[:10]
     }
 
@@ -574,13 +705,13 @@ def fine_grained_search(
     Returns:
         Dictionary with best configuration and results
     """
-    # Generate alpha values
-    alpha_min = alpha_center - alpha_range
+    # Generate alpha values (ensure non-negative)
+    alpha_min = max(0.0, alpha_center - alpha_range)
     alpha_max = alpha_center + alpha_range
     alpha_values = np.arange(alpha_min, alpha_max + alpha_step, alpha_step).tolist()
     
-    # Generate top_k values
-    topk_min = max(0.1, topk_center - topk_range)
+    # Generate top_k values (ensure valid range [0.05, 1.0])
+    topk_min = max(0.05, topk_center - topk_range)
     topk_max = min(1.0, topk_center + topk_range)
     topk_values = np.arange(topk_min, topk_max + topk_step, topk_step).tolist()
     
@@ -608,7 +739,7 @@ def fine_grained_search(
         task = progress.add_task("Optimizing...", total=total_configs)
         
         for alpha, topk in configs:
-            config = SAUPConfig(
+            config = TRACERConfig(
                 alpha=alpha,
                 beta=beta,
                 gamma=gamma,
@@ -701,7 +832,7 @@ def ensemble_optimization(
         task = progress.add_task("Optimizing...", total=total_configs)
         
         for ens in ensemble_weights:
-            config = SAUPConfig(
+            config = TRACERConfig(
                 alpha=alpha,
                 beta=beta,
                 gamma=gamma,
@@ -794,7 +925,7 @@ def custom_grid_search(
         task = progress.add_task("Optimizing...", total=total_configs)
         
         for alpha, beta, gamma, topk, ens in configs:
-            config = SAUPConfig(
+            config = TRACERConfig(
                 alpha=alpha,
                 beta=beta,
                 gamma=gamma,
@@ -920,7 +1051,7 @@ def print_results(optimization_results: dict[str, Any], console: Console):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Optimize SAUP-D parameters for failure prediction",
+        description="Optimize TRACER parameters for failure prediction",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__
     )
@@ -934,9 +1065,23 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["auto", "coarse", "fine", "ensemble", "custom"],
+        choices=["auto", "coarse", "fine", "ensemble", "custom", "random", "wide"],
         default="auto",
-        help="Optimization mode (default: auto - runs all 3 stages sequentially)"
+        help="Optimization mode: auto (3 stages), random (random search), wide (broad grid + random)"
+    )
+    
+    # Random search parameters
+    parser.add_argument(
+        "--n-random",
+        type=int,
+        default=500,
+        help="Number of random configurations to test in random search mode (default: 500)"
+    )
+    parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (default: None)"
     )
     
     # Fine-grained search parameters
@@ -1104,6 +1249,110 @@ def main():
     elif args.mode == "coarse":
         optimization_results = coarse_grid_search(merged_results, console, precomputed_data)
     
+    elif args.mode == "random":
+        # Random search mode - explore parameter space randomly
+        optimization_results = random_search(
+            merged_results,
+            console,
+            n_iterations=args.n_random,
+            alpha_range=(0.0, 20.0),
+            beta_range=(0.0, 20.0),
+            gamma_range=(0.0, 20.0),
+            topk_range=(0.05, 1.0),
+            ensemble_range=(0.0, 0.5),
+            precomputed_data=precomputed_data,
+            seed=args.random_seed
+        )
+    
+    elif args.mode == "wide":
+        # Wide search: combination of broad grid + random exploration
+        console.print("\n[bold magenta]WIDE SEARCH MODE: Grid + Random Exploration[/bold magenta]\n")
+        
+        # Stage 1: Very wide grid search
+        console.print("[bold]Phase 1: Wide Grid Search[/bold]")
+        wide_alpha = [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 15.0, 20.0]
+        wide_beta = [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 15.0]
+        wide_gamma = [0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0]
+        wide_topk = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]
+        wide_ensemble = [0.0, 0.1, 0.15, 0.2, 0.25, 0.3]
+        
+        wide_configs = list(itertools.product(wide_alpha[:8], wide_beta[:5], wide_gamma[:5], wide_topk[:6], wide_ensemble[:3]))
+        total_wide = len(wide_configs)
+        
+        console.print(f"Testing {total_wide} wide grid configurations...\n")
+        
+        wide_results = []
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeRemainingColumn(),
+            console=console
+        ) as progress:
+            task_wide = progress.add_task("Wide Grid...", total=total_wide)
+            
+            for alpha, beta, gamma, topk, ensemble in wide_configs:
+                config = TRACERConfig(
+                    alpha=alpha,
+                    beta=beta,
+                    gamma=gamma,
+                    top_k_percentile=topk,
+                    ensemble_weight_max=ensemble
+                )
+                
+                if precomputed_data is not None:
+                    auroc = evaluate_config_fast(config, precomputed_data)
+                else:
+                    auroc = evaluate_config(config, merged_results)
+                
+                if auroc is not None:
+                    wide_results.append({
+                        'config': {
+                            'alpha': alpha,
+                            'beta': beta,
+                            'gamma': gamma,
+                            'top_k_percentile': topk,
+                            'ensemble_weight_max': ensemble
+                        },
+                        'auroc': auroc
+                    })
+                
+                progress.update(task_wide, advance=1)
+        
+        wide_results.sort(key=lambda x: x['auroc'], reverse=True)
+        console.print(f"\n✓ Wide Grid Complete: Best AUROC = {wide_results[0]['auroc']:.4f}\n")
+        
+        # Stage 2: Random search with very wide bounds
+        console.print("[bold]Phase 2: Random Exploration[/bold]")
+        random_results = random_search(
+            merged_results,
+            console,
+            n_iterations=1000,
+            alpha_range=(0.0, 30.0),
+            beta_range=(0.0, 30.0),
+            gamma_range=(0.0, 30.0),
+            topk_range=(0.01, 1.0),
+            ensemble_range=(0.0, 0.6),
+            precomputed_data=precomputed_data,
+            seed=args.random_seed
+        )
+        
+        # Combine results
+        all_results = wide_results + random_results.get('top_10_configs', [])
+        all_results.sort(key=lambda x: x['auroc'], reverse=True)
+        
+        optimization_results = {
+            'mode': 'wide',
+            'total_configurations': total_wide + args.n_random,
+            'successful_evaluations': len(wide_results) + random_results['successful_evaluations'],
+            'best_config': all_results[0]['config'],
+            'best_auroc': all_results[0]['auroc'],
+            'top_10_configs': all_results[:10],
+            'wide_grid_best': wide_results[0]['auroc'],
+            'random_search_best': random_results['best_auroc']
+        }
+
     elif args.mode == "fine":
         optimization_results = fine_grained_search(
             merged_results,
@@ -1196,7 +1445,7 @@ def main():
     console.print("\n[bold cyan]To use the best configuration:[/bold cyan]")
     best = optimization_results['best_config']
     console.print(f"python -m tau2.scripts.analyze_uncertainty data/simulations/file.json \\")
-    console.print(f"  --saup-config '{{")
+    console.print(f"  --tracer-config '{{")
     console.print(f"    \"alpha\": {best['alpha']},")
     console.print(f"    \"beta\": {best['beta']},")
     console.print(f"    \"gamma\": {best['gamma']},")
