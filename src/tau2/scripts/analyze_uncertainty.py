@@ -221,7 +221,7 @@ def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = F
 
         uncertainty_scores.append(turn_data)
 
-    # Calculate TRACER aggregation score (using ADDITIVE formula)
+    # Calculate TRACER aggregation score
     tracer_metrics = None
     if uncertainty_scores:
         step_data = [
@@ -558,7 +558,7 @@ def calculate_baseline_aurocs(
                     if msg.role != role_filter:
                         continue
                 else:
-                    # Full analysis: Use ALL messages (both assistant and user), consistent with TRACER
+                    # Full analysis: Use ALL messages (both assistant and user)
                     # Only filter out system messages
                     if msg.role not in ["assistant", "user"]:
                         continue
