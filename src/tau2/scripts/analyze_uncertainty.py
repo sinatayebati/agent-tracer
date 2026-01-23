@@ -107,13 +107,39 @@ class AUROCMetrics(BaseModel):
     std_tracer_successes: float
 
 
+class AUARCMetrics(BaseModel):
+    """AUARC evaluation metrics for selective prediction.
+    
+    Area Under Accuracy-Rejection Curve measures how well the uncertainty
+    score can identify which predictions to reject to improve accuracy.
+    
+    The curve plots accuracy vs. coverage (1 - rejection_rate), where we
+    progressively reject samples with highest uncertainty scores.
+    """
+    
+    auarc: float  # Area under the accuracy-rejection curve (higher is better)
+    max_accuracy: float  # Maximum achievable accuracy with selective prediction
+    accuracy_at_50_coverage: float  # Accuracy when covering 50% of samples
+    accuracy_at_80_coverage: float  # Accuracy when covering 80% of samples
+    optimal_coverage: float  # Coverage that maximizes (accuracy - baseline_accuracy)
+    optimal_accuracy: float  # Accuracy at optimal coverage
+    baseline_accuracy: float  # Accuracy without rejection (all samples)
+    num_samples: int
+    num_failures: int
+    num_successes: int
+    coverages: list[float]  # Coverage points (for plotting)
+    accuracies: list[float]  # Accuracy at each coverage (for plotting)
+
+
 class UncertaintyAnalysis(BaseModel):
     """Complete uncertainty analysis results."""
 
     metadata: dict
     results: list[SimulationUncertainty]
     auroc_metrics: Optional[AUROCMetrics] = None
+    auarc_metrics: Optional[AUARCMetrics] = None  # NEW: Selective prediction metrics for TRACER
     baseline_aurocs: Optional[dict] = None
+    baseline_auarcs: Optional[dict] = None  # NEW: Selective prediction metrics for baselines
     ablation_studies: Optional[dict] = None  # Stores ablation analysis results
 
 
@@ -740,6 +766,461 @@ def calculate_baseline_aurocs(
     return results
 
 
+def calculate_auarc_metrics(
+    analyzed_sims: list[SimulationUncertainty]
+) -> Optional[AUARCMetrics]:
+    """
+    Calculate AUARC (Area Under Accuracy-Rejection Curve) metrics for selective prediction.
+    
+    AUARC measures how well the uncertainty score (TRACER) can identify which predictions
+    to reject in order to improve accuracy. This is a key metric for selective prediction
+    systems where the agent can choose to abstain from making predictions on uncertain cases.
+    
+    The algorithm:
+    1. Sort all samples by TRACER score in descending order (highest uncertainty first)
+    2. For each coverage level (1.0, 0.95, ..., 0.05):
+       - Keep only the most confident samples (lowest TRACER scores)
+       - Calculate accuracy on the retained samples
+    3. Compute the area under the accuracy-coverage curve using trapezoidal rule
+    
+    Args:
+        analyzed_sims: List of analyzed simulations with TRACER metrics and ground truth
+        
+    Returns:
+        AUARCMetrics if calculation successful, None otherwise
+    
+    Example:
+        - If rejecting top 20% uncertain samples improves accuracy from 60% to 75%,
+          this indicates TRACER is successfully identifying problematic cases
+        - AUARC summarizes this behavior across all coverage levels
+    """
+    # Extract TRACER scores and ground truth labels
+    samples = []
+    
+    for sim in analyzed_sims:
+        # Need both ground truth and TRACER score
+        if sim.ground_truth_pass is None or sim.tracer_metrics is None:
+            continue
+        
+        tracer_score = sim.tracer_metrics.get('tracer_score')
+        if tracer_score is None:
+            continue
+        
+        # Store (TRACER score, is_correct)
+        is_correct = sim.ground_truth_pass
+        samples.append((tracer_score, is_correct))
+    
+    # Need at least 10 samples for meaningful AUARC
+    if len(samples) < 10:
+        logger.warning(f"Not enough samples for AUARC calculation ({len(samples)} < 10). Skipping.")
+        return None
+    
+    try:
+        # Sort by TRACER score descending (most uncertain first)
+        samples_sorted = sorted(samples, key=lambda x: x[0], reverse=True)
+        
+        # Extract sorted arrays
+        tracer_scores = np.array([s[0] for s in samples_sorted])
+        correctness = np.array([s[1] for s in samples_sorted])
+        
+        total_samples = len(samples)
+        num_successes = int(np.sum(correctness))
+        num_failures = total_samples - num_successes
+        
+        # Calculate baseline accuracy (no rejection)
+        baseline_accuracy = float(np.mean(correctness))
+        
+        # Calculate accuracy at different coverage levels
+        # Coverage = fraction of samples we keep (1.0 = keep all, 0.5 = keep half)
+        # We reject from the high-uncertainty end
+        
+        coverages = []
+        accuracies = []
+        
+        # Generate coverage points: 100%, 95%, 90%, ..., 5%
+        coverage_points = np.linspace(1.0, 0.05, 20)
+        
+        for coverage in coverage_points:
+            # Number of samples to keep
+            n_keep = int(np.ceil(coverage * total_samples))
+            n_keep = max(1, min(n_keep, total_samples))  # Clamp to valid range
+            
+            # Reject the most uncertain samples (first n_reject samples)
+            # Keep the most confident samples (last n_keep samples)
+            n_reject = total_samples - n_keep
+            kept_samples = correctness[n_reject:]
+            
+            # Calculate accuracy on kept samples
+            if len(kept_samples) > 0:
+                accuracy = float(np.mean(kept_samples))
+            else:
+                accuracy = 0.0
+            
+            coverages.append(float(coverage))
+            accuracies.append(accuracy)
+        
+        # Compute AUARC using trapezoidal rule
+        # AUARC = integral of accuracy over coverage [0, 1]
+        # Need to reverse arrays since coverage goes from 1.0 to 0.05 (decreasing)
+        # Trapezoidal rule requires increasing x values
+        auarc = float(np.trapezoid(list(reversed(accuracies)), list(reversed(coverages))))
+        
+        # Find maximum achievable accuracy
+        max_accuracy = float(np.max(accuracies))
+        
+        # Find accuracy at specific coverage levels
+        accuracy_at_50 = accuracies[np.argmin(np.abs(np.array(coverages) - 0.5))]
+        accuracy_at_80 = accuracies[np.argmin(np.abs(np.array(coverages) - 0.8))]
+        
+        # Find optimal coverage (maximizes accuracy - baseline_accuracy)
+        improvements = np.array(accuracies) - baseline_accuracy
+        optimal_idx = np.argmax(improvements)
+        optimal_coverage = float(coverages[optimal_idx])
+        optimal_accuracy = float(accuracies[optimal_idx])
+        
+        logger.info(f"AUARC: {auarc:.4f}, Max Accuracy: {max_accuracy:.4f}, Baseline: {baseline_accuracy:.4f}")
+        
+        return AUARCMetrics(
+            auarc=auarc,
+            max_accuracy=max_accuracy,
+            accuracy_at_50_coverage=float(accuracy_at_50),
+            accuracy_at_80_coverage=float(accuracy_at_80),
+            optimal_coverage=optimal_coverage,
+            optimal_accuracy=optimal_accuracy,
+            baseline_accuracy=baseline_accuracy,
+            num_samples=total_samples,
+            num_failures=num_failures,
+            num_successes=num_successes,
+            coverages=coverages,
+            accuracies=accuracies
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to calculate AUARC: {e}")
+        return None
+
+
+def calculate_baseline_auarcs(
+    analyzed_sims: list[SimulationUncertainty],
+    original_results: Results = None,
+    config: Optional[TRACERConfig] = None
+) -> Optional[dict]:
+    """
+    Calculate AUARC metrics for baseline predictors (selective prediction evaluation).
+    
+    This function evaluates baseline metrics to compare against TRACER:
+    1. Normalized Entropy only (mean U_i)
+    2. Self-assessed Confidence (extracted from original simulation messages if available)
+    3. SAUP (multiplicative weighting with RMS aggregation)
+    
+    Args:
+        analyzed_sims: List of analyzed simulations with summary statistics
+        original_results: Original Results object to extract self-assessed confidence
+        config: TRACER configuration (only needed for SAUP)
+        
+    Returns:
+        Dictionary with baseline AUARC metrics matching TRACER schema, or None if calculation fails
+    """
+    if config is None:
+        config = TRACERConfig()
+    
+    results = {}
+    
+    #########################################################################################
+    # Baseline 1: Normalized Entropy (U_i) only
+    #########################################################################################
+    samples_entropy = []
+    
+    for sim in analyzed_sims:
+        if sim.ground_truth_pass is None:
+            continue
+        
+        # Use mean_uncertainty_overall (all steps), consistent with TRACER
+        mean_uncertainty = sim.summary.get('mean_uncertainty_overall')
+        if mean_uncertainty is None:
+            continue
+        
+        # Store (uncertainty_score, is_correct)
+        is_correct = sim.ground_truth_pass
+        samples_entropy.append((mean_uncertainty, is_correct))
+    
+    # Calculate AUARC for normalized entropy baseline
+    if len(samples_entropy) >= 10:
+        try:
+            # Sort by uncertainty descending (most uncertain first)
+            samples_sorted = sorted(samples_entropy, key=lambda x: x[0], reverse=True)
+            
+            tracer_scores = np.array([s[0] for s in samples_sorted])
+            correctness = np.array([s[1] for s in samples_sorted])
+            
+            total_samples = len(samples_entropy)
+            num_successes = int(np.sum(correctness))
+            num_failures = total_samples - num_successes
+            baseline_accuracy = float(np.mean(correctness))
+            
+            # Calculate accuracy at different coverage levels
+            coverages = []
+            accuracies = []
+            coverage_points = np.linspace(1.0, 0.05, 20)
+            
+            for coverage in coverage_points:
+                n_keep = int(np.ceil(coverage * total_samples))
+                n_keep = max(1, min(n_keep, total_samples))
+                n_reject = total_samples - n_keep
+                kept_samples = correctness[n_reject:]
+                
+                if len(kept_samples) > 0:
+                    accuracy = float(np.mean(kept_samples))
+                else:
+                    accuracy = 0.0
+                
+                coverages.append(float(coverage))
+                accuracies.append(accuracy)
+            
+            # Compute AUARC
+            # Need to reverse arrays since coverage goes from 1.0 to 0.05 (decreasing)
+            auarc = float(np.trapezoid(list(reversed(accuracies)), list(reversed(coverages))))
+            max_accuracy = float(np.max(accuracies))
+            accuracy_at_50 = accuracies[np.argmin(np.abs(np.array(coverages) - 0.5))]
+            accuracy_at_80 = accuracies[np.argmin(np.abs(np.array(coverages) - 0.8))]
+            
+            improvements = np.array(accuracies) - baseline_accuracy
+            optimal_idx = np.argmax(improvements)
+            optimal_coverage = float(coverages[optimal_idx])
+            optimal_accuracy = float(accuracies[optimal_idx])
+            
+            results['normalized_entropy'] = {
+                'auarc': auarc,
+                'max_accuracy': max_accuracy,
+                'accuracy_at_50_coverage': float(accuracy_at_50),
+                'accuracy_at_80_coverage': float(accuracy_at_80),
+                'optimal_coverage': optimal_coverage,
+                'optimal_accuracy': optimal_accuracy,
+                'baseline_accuracy': baseline_accuracy,
+                'num_samples': total_samples,
+                'num_failures': num_failures,
+                'num_successes': num_successes,
+                'coverages': coverages,
+                'accuracies': accuracies
+            }
+            logger.info(f"Normalized Entropy baseline AUARC: {auarc:.4f}")
+        except Exception as e:
+            logger.warning(f"Failed to calculate AUARC for normalized entropy baseline: {e}")
+    
+    #########################################################################################
+    # Baseline 2: Self-assessed Confidence (extract from original simulation data)
+    #########################################################################################
+    samples_confidence = []
+    
+    if original_results is not None:
+        for sim in original_results.simulations:
+            # Get ground truth
+            ground_truth_reward = sim.reward_info.reward if sim.reward_info else None
+            if ground_truth_reward is None:
+                continue
+            
+            ground_truth_pass = ground_truth_reward == 1.0
+            is_correct = ground_truth_pass
+            
+            # Extract self-assessed confidence from messages (all roles)
+            confidences = []
+            for msg in sim.messages:
+                if msg.role not in ["assistant", "user"]:
+                    continue
+                
+                if hasattr(msg, 'uncertainty') and msg.uncertainty is not None:
+                    confidence = msg.uncertainty.get('self_assessed_confidence')
+                    if confidence is not None:
+                        confidences.append(confidence)
+            
+            if not confidences:
+                continue
+            
+            mean_confidence = float(np.mean(confidences))
+            samples_confidence.append((mean_confidence, is_correct))
+    
+    # Calculate AUARC for self-assessed confidence baseline
+    if len(samples_confidence) >= 10:
+        try:
+            # Sort by confidence descending (most uncertain/low confidence first)
+            # Higher confidence = lower uncertainty, so reverse sort
+            samples_sorted = sorted(samples_confidence, key=lambda x: x[0], reverse=True)
+            
+            confidence_scores = np.array([s[0] for s in samples_sorted])
+            correctness = np.array([s[1] for s in samples_sorted])
+            
+            total_samples = len(samples_confidence)
+            num_successes = int(np.sum(correctness))
+            num_failures = total_samples - num_successes
+            baseline_accuracy = float(np.mean(correctness))
+            
+            # Calculate accuracy at different coverage levels
+            coverages = []
+            accuracies = []
+            coverage_points = np.linspace(1.0, 0.05, 20)
+            
+            for coverage in coverage_points:
+                n_keep = int(np.ceil(coverage * total_samples))
+                n_keep = max(1, min(n_keep, total_samples))
+                n_reject = total_samples - n_keep
+                kept_samples = correctness[n_reject:]
+                
+                if len(kept_samples) > 0:
+                    accuracy = float(np.mean(kept_samples))
+                else:
+                    accuracy = 0.0
+                
+                coverages.append(float(coverage))
+                accuracies.append(accuracy)
+            
+            # Compute AUARC
+            # Need to reverse arrays since coverage goes from 1.0 to 0.05 (decreasing)
+            auarc = float(np.trapezoid(list(reversed(accuracies)), list(reversed(coverages))))
+            max_accuracy = float(np.max(accuracies))
+            accuracy_at_50 = accuracies[np.argmin(np.abs(np.array(coverages) - 0.5))]
+            accuracy_at_80 = accuracies[np.argmin(np.abs(np.array(coverages) - 0.8))]
+            
+            improvements = np.array(accuracies) - baseline_accuracy
+            optimal_idx = np.argmax(improvements)
+            optimal_coverage = float(coverages[optimal_idx])
+            optimal_accuracy = float(accuracies[optimal_idx])
+            
+            results['self_assessed_confidence'] = {
+                'auarc': auarc,
+                'max_accuracy': max_accuracy,
+                'accuracy_at_50_coverage': float(accuracy_at_50),
+                'accuracy_at_80_coverage': float(accuracy_at_80),
+                'optimal_coverage': optimal_coverage,
+                'optimal_accuracy': optimal_accuracy,
+                'baseline_accuracy': baseline_accuracy,
+                'num_samples': total_samples,
+                'num_failures': num_failures,
+                'num_successes': num_successes,
+                'coverages': coverages,
+                'accuracies': accuracies
+            }
+            logger.info(f"Self-assessed Confidence baseline AUARC: {auarc:.4f}")
+        except Exception as e:
+            logger.warning(f"Failed to calculate AUARC for self-assessed confidence baseline: {e}")
+    else:
+        logger.info("Self-assessed confidence data not available or insufficient for baseline AUARC calculation")
+    
+    #########################################################################################
+    # Baseline 3: SAUP (multiplicative weighting with RMS aggregation)
+    #########################################################################################
+    samples_saup = []
+    
+    for sim in analyzed_sims:
+        if sim.ground_truth_pass is None:
+            continue
+        
+        # Use ALL steps (both agent and user), consistent with TRACER
+        filtered_scores = sim.uncertainty_scores
+        
+        if not filtered_scores:
+            continue
+        
+        # Build step_data from uncertainty_scores
+        step_data = []
+        for score in filtered_scores:
+            # Extract do_agent and do_user based on do_type
+            do_agent = None
+            do_user = None
+            if score.do_score is not None and score.do_type is not None:
+                if score.do_type == 'agent_coherence':
+                    do_agent = score.do_score
+                elif score.do_type == 'user_coherence':
+                    do_user = score.do_score
+            
+            step_data.append({
+                'ui': score.ui_score,
+                'da': score.da_score,
+                'do_agent': do_agent,
+                'do_user': do_user
+            })
+        
+        if not step_data:
+            continue
+        
+        # Calculate SAUP score
+        saup_result = calculate_saup_score(step_data, config)
+        saup_score = saup_result['saup_score']
+        
+        # Store (saup_score, is_correct)
+        is_correct = sim.ground_truth_pass
+        samples_saup.append((saup_score, is_correct))
+    
+    # Calculate AUARC for SAUP baseline
+    if len(samples_saup) >= 10:
+        try:
+            # Sort by SAUP descending (most uncertain first)
+            samples_sorted = sorted(samples_saup, key=lambda x: x[0], reverse=True)
+            
+            saup_scores = np.array([s[0] for s in samples_sorted])
+            correctness = np.array([s[1] for s in samples_sorted])
+            
+            total_samples = len(samples_saup)
+            num_successes = int(np.sum(correctness))
+            num_failures = total_samples - num_successes
+            baseline_accuracy = float(np.mean(correctness))
+            
+            # Calculate accuracy at different coverage levels
+            coverages = []
+            accuracies = []
+            coverage_points = np.linspace(1.0, 0.05, 20)
+            
+            for coverage in coverage_points:
+                n_keep = int(np.ceil(coverage * total_samples))
+                n_keep = max(1, min(n_keep, total_samples))
+                n_reject = total_samples - n_keep
+                kept_samples = correctness[n_reject:]
+                
+                if len(kept_samples) > 0:
+                    accuracy = float(np.mean(kept_samples))
+                else:
+                    accuracy = 0.0
+                
+                coverages.append(float(coverage))
+                accuracies.append(accuracy)
+            
+            # Compute AUARC
+            # Need to reverse arrays since coverage goes from 1.0 to 0.05 (decreasing)
+            auarc = float(np.trapezoid(list(reversed(accuracies)), list(reversed(coverages))))
+            max_accuracy = float(np.max(accuracies))
+            accuracy_at_50 = accuracies[np.argmin(np.abs(np.array(coverages) - 0.5))]
+            accuracy_at_80 = accuracies[np.argmin(np.abs(np.array(coverages) - 0.8))]
+            
+            improvements = np.array(accuracies) - baseline_accuracy
+            optimal_idx = np.argmax(improvements)
+            optimal_coverage = float(coverages[optimal_idx])
+            optimal_accuracy = float(accuracies[optimal_idx])
+            
+            results['saup'] = {
+                'auarc': auarc,
+                'max_accuracy': max_accuracy,
+                'accuracy_at_50_coverage': float(accuracy_at_50),
+                'accuracy_at_80_coverage': float(accuracy_at_80),
+                'optimal_coverage': optimal_coverage,
+                'optimal_accuracy': optimal_accuracy,
+                'baseline_accuracy': baseline_accuracy,
+                'num_samples': total_samples,
+                'num_failures': num_failures,
+                'num_successes': num_successes,
+                'coverages': coverages,
+                'accuracies': accuracies
+            }
+            logger.info(f"SAUP baseline AUARC: {auarc:.4f}")
+        except Exception as e:
+            logger.warning(f"Failed to calculate AUARC for SAUP baseline: {e}")
+    
+    if not results:
+        logger.warning("No baseline AUARCs could be calculated")
+        return None
+    
+    logger.info(f"Calculated AUARC for {len(results)} baseline metric(s)")
+    return results
+
+
 def analyze_results(results: Results, config: TRACERConfig, verbose: bool = False, calculate_auroc: bool = True) -> UncertaintyAnalysis:
     """
     Analyze all simulations in the results.
@@ -771,13 +1252,21 @@ def analyze_results(results: Results, config: TRACERConfig, verbose: bool = Fals
     
     # Calculate AUROC metrics if requested and TRACER scores are available
     auroc_metrics = None
+    auarc_metrics = None
     baseline_aurocs = None
+    baseline_auarcs = None
     ablation_studies = None
     
     if calculate_auroc:
         # Full analysis (default - uses all turns for TRACER, agent-only for baselines)
+        logger.info("Calculating AUROC metrics for failure prediction...")
         auroc_metrics = calculate_auroc_metrics(analyzed_sims)
         baseline_aurocs = calculate_baseline_aurocs(analyzed_sims, original_results=results)
+        
+        # Calculate AUARC metrics (only for full analysis with both agent and user signals)
+        logger.info("Calculating AUARC metrics for selective prediction...")
+        auarc_metrics = calculate_auarc_metrics(analyzed_sims)
+        baseline_auarcs = calculate_baseline_auarcs(analyzed_sims, original_results=results, config=config)
         
         # Ablation studies: isolate assistant-only and user-only
         logger.info("Running ablation studies...")
@@ -831,7 +1320,9 @@ def analyze_results(results: Results, config: TRACERConfig, verbose: bool = Fals
         metadata=metadata,
         results=analyzed_sims,
         auroc_metrics=auroc_metrics,
+        auarc_metrics=auarc_metrics,
         baseline_aurocs=baseline_aurocs,
+        baseline_auarcs=baseline_auarcs,
         ablation_studies=ablation_studies
     )
 
@@ -1278,6 +1769,133 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                 console.print(f"  [yellow]   Best baseline: {best_baseline_name} (AUROC={best_baseline_auroc:.4f})[/yellow]")
         else:
             console.print("  [yellow]⚠️  TRACER AUROC not available for comparison[/yellow]")
+    
+    # AUARC Evaluation (Selective Prediction)
+    if analysis.auarc_metrics is not None:
+        auarc = analysis.auarc_metrics
+        console.print("\n[bold cyan]AUARC Evaluation (Selective Prediction)[/bold cyan]")
+        console.print(f"  Hypothesis: Rejecting high-TRACER samples improves accuracy")
+        console.print(f"  Dataset: {auarc.num_samples} tasks ({auarc.num_failures} failures, {auarc.num_successes} successes)")
+        console.print()
+        
+        # AUARC interpretation
+        auarc_value = auarc.auarc
+        baseline_acc = auarc.baseline_accuracy
+        max_acc = auarc.max_accuracy
+        
+        # Calculate potential improvement
+        improvement = max_acc - baseline_acc
+        
+        if improvement > 0.1:
+            auarc_color = "green"
+            auarc_label = "Excellent selective prediction"
+        elif improvement > 0.05:
+            auarc_color = "green"
+            auarc_label = "Good selective prediction"
+        elif improvement > 0.02:
+            auarc_color = "yellow"
+            auarc_label = "Fair selective prediction"
+        else:
+            auarc_color = "red"
+            auarc_label = "Poor selective prediction"
+        
+        console.print(f"  AUARC Score: [{auarc_color}]{auarc_value:.4f}[/{auarc_color}]")
+        console.print(f"  Baseline Accuracy (no rejection): {baseline_acc:.4f}")
+        console.print(f"  Max Accuracy (with rejection): [{auarc_color}]{max_acc:.4f}[/{auarc_color}]")
+        console.print(f"  Potential Improvement: [{auarc_color}]+{improvement:.4f}[/{auarc_color}] ({auarc_label})")
+        console.print()
+        
+        console.print(f"  Accuracy at 80% coverage: {auarc.accuracy_at_80_coverage:.4f}")
+        console.print(f"  Accuracy at 50% coverage: {auarc.accuracy_at_50_coverage:.4f}")
+        console.print(f"  Optimal coverage: {auarc.optimal_coverage:.1%} (accuracy: {auarc.optimal_accuracy:.4f})")
+        
+        # Interpretation
+        console.print()
+        if improvement > 0.05:
+            console.print(f"  [green]✅ TRACER enables effective selective prediction![/green]")
+            console.print(f"  [green]   By rejecting {(1-auarc.optimal_coverage)*100:.1f}% of high-uncertainty samples,[/green]")
+            console.print(f"  [green]   accuracy improves from {baseline_acc:.1%} to {auarc.optimal_accuracy:.1%}.[/green]")
+        elif improvement > 0.02:
+            console.print(f"  [yellow]⚠️  TRACER shows modest selective prediction capability.[/yellow]")
+            console.print(f"  [yellow]   Improvement: +{improvement:.1%} at {auarc.optimal_coverage:.1%} coverage.[/yellow]")
+        else:
+            console.print(f"  [red]❌ TRACER shows limited selective prediction capability.[/red]")
+            console.print(f"  [yellow]   Rejecting uncertain samples yields minimal accuracy gains.[/yellow]")
+    
+    # Baseline Comparison for AUARC
+    if analysis.baseline_auarcs is not None and len(analysis.baseline_auarcs) > 0:
+        console.print("\n[bold cyan]AUARC Baseline Comparison[/bold cyan]")
+        console.print("  Comparing TRACER against simpler baseline metrics for selective prediction:\n")
+        
+        # Create comparison table
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Metric", style="white", width=35)
+        table.add_column("AUARC", justify="right", width=10)
+        table.add_column("Baseline Acc", justify="right", width=12)
+        table.add_column("Max Acc", justify="right", width=10)
+        table.add_column("Improvement", justify="right", width=12)
+        table.add_column("Optimal Cov", justify="right", width=12)
+        
+        # Add TRACER as first row
+        tracer_auarc_obj = analysis.auarc_metrics
+        
+        if tracer_auarc_obj is not None:
+            tracer_improvement = tracer_auarc_obj.max_accuracy - tracer_auarc_obj.baseline_accuracy
+            table.add_row(
+                "[bold]TRACER (Full Framework)[/bold]",
+                f"[bold]{tracer_auarc_obj.auarc:.4f}[/bold]",
+                f"[bold]{tracer_auarc_obj.baseline_accuracy:.4f}[/bold]",
+                f"[bold]{tracer_auarc_obj.max_accuracy:.4f}[/bold]",
+                f"[bold]+{tracer_improvement:.4f}[/bold]",
+                f"[bold]{tracer_auarc_obj.optimal_coverage:.1%}[/bold]"
+            )
+            
+            # Add baseline rows
+            baseline_names = {
+                'saup': 'SAUP (RMS Weighted Uncertainty)',
+                'normalized_entropy': 'Normalized Entropy (U_i) Only',
+                'self_assessed_confidence': 'Self-Assessed Confidence Only'
+            }
+            
+            for baseline_key, baseline_metrics in analysis.baseline_auarcs.items():
+                display_name = baseline_names.get(baseline_key, baseline_key)
+                baseline_improvement = baseline_metrics['max_accuracy'] - baseline_metrics['baseline_accuracy']
+                
+                table.add_row(
+                    display_name,
+                    f"{baseline_metrics['auarc']:.4f}",
+                    f"{baseline_metrics['baseline_accuracy']:.4f}",
+                    f"{baseline_metrics['max_accuracy']:.4f}",
+                    f"+{baseline_improvement:.4f}",
+                    f"{baseline_metrics['optimal_coverage']:.1%}"
+                )
+            
+            console.print(table)
+            console.print()
+            
+            # Interpretation
+            best_baseline_improvement = max(
+                b['max_accuracy'] - b['baseline_accuracy'] 
+                for b in analysis.baseline_auarcs.values()
+            )
+            best_baseline_key = max(
+                analysis.baseline_auarcs.items(),
+                key=lambda x: x[1]['max_accuracy'] - x[1]['baseline_accuracy']
+            )[0]
+            best_baseline_name = baseline_names.get(best_baseline_key, best_baseline_key)
+            
+            improvement_diff = tracer_improvement - best_baseline_improvement
+            
+            if improvement_diff > 0.02:
+                console.print(f"  [green]✅ TRACER outperforms all baseline metrics for selective prediction[/green]")
+                console.print(f"  [green]   Additional improvement over best baseline: +{improvement_diff:.4f}[/green]")
+            elif improvement_diff > 0:
+                console.print(f"  [yellow]⚠️  TRACER shows modest improvement over best baseline (+{improvement_diff:.4f})[/yellow]")
+            else:
+                console.print(f"  [red]❌ TRACER does not outperform best baseline for selective prediction[/red]")
+                console.print(f"  [yellow]   Best baseline: {best_baseline_name} (improvement: +{best_baseline_improvement:.4f})[/yellow]")
+        else:
+            console.print("  [yellow]⚠️  TRACER AUARC not available for comparison[/yellow]")
 
     # Ablation Studies
     if analysis.ablation_studies is not None and len(analysis.ablation_studies) > 0:
