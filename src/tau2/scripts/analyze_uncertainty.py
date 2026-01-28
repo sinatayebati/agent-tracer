@@ -68,12 +68,16 @@ class TurnUncertainty(BaseModel):
     turn: int
     actor: str
     role: str
-    ui_score: float
     content_preview: str
     statistics: Optional[dict] = None
     da_score: Optional[float] = None
     do_score: Optional[float] = None
     do_type: Optional[str] = None
+    normentropy_filtered_score: float  # Normalized entropy with content-token filtering applied
+    normentropy_score: Optional[float] = None  # Raw normalized entropy (before filtering)
+    selfconf_score: Optional[float] = None  # Self-assessed confidence from raw data
+    saup_score: Optional[float] = None  # Per-turn cumulative SAUP score
+    tracer_score: Optional[float] = None  # Per-turn cumulative TRACER score
 
 
 class SimulationUncertainty(BaseModel):
@@ -131,6 +135,20 @@ class AUARCMetrics(BaseModel):
     accuracies: list[float]  # Accuracy at each coverage (for plotting)
 
 
+class EarlyWarningMetrics(BaseModel):
+    """Early warning analysis metrics showing when each metric signals failure."""
+    
+    num_failed_tasks: int
+    metric_name: str
+    mean_peak_percentage: float  # Mean percentage of trajectory where peak occurs
+    median_peak_percentage: float  # Median percentage of trajectory where peak occurs
+    std_peak_percentage: float  # Std dev of peak percentages
+    percent_before_20: float  # Percentage of tasks where metric peaks before 20% of turns
+    percent_before_40: float  # Percentage of tasks where metric peaks before 40% of turns
+    percent_before_60: float  # Percentage of tasks where metric peaks before 60% of turns
+    percent_before_80: float  # Percentage of tasks where metric peaks before 80% of turns
+
+
 class UncertaintyAnalysis(BaseModel):
     """Complete uncertainty analysis results."""
 
@@ -141,6 +159,7 @@ class UncertaintyAnalysis(BaseModel):
     baseline_aurocs: Optional[dict] = None
     baseline_auarcs: Optional[dict] = None  # NEW: Selective prediction metrics for baselines
     ablation_studies: Optional[dict] = None  # Stores ablation analysis results
+    early_warning_metrics: Optional[dict[str, EarlyWarningMetrics]] = None  # NEW: Early warning analysis
 
 
 def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = False) -> SimulationUncertainty:
@@ -178,9 +197,16 @@ def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = F
         # Determine actor type
         actor = "agent" if role == "assistant" else "user"
 
-        # Extract logprobs and calculate uncertainty
+        # Extract logprobs and calculate filtered normalized entropy
         logprobs = message.get("logprobs")
-        ui_score = calculate_normalized_entropy(logprobs)
+        normentropy_filtered_score = calculate_normalized_entropy(logprobs)
+        
+        # Extract raw normalized entropy (before filtering) from uncertainty data
+        normentropy_score = None
+        selfconf_score = None
+        if "uncertainty" in message and message["uncertainty"] is not None:
+            normentropy_score = message["uncertainty"].get("normalized_entropy")
+            selfconf_score = message["uncertainty"].get("self_assessed_confidence")
         
         # Calculate HYBRID REPETITION for agent messages
         da_score = None
@@ -229,7 +255,6 @@ def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = F
             turn=turn_counter,
             actor=actor,
             role=role,
-            ui_score=ui_score,
             content_preview=(
                 message.get("content", "")[:100]
                 if message.get("content")
@@ -238,6 +263,10 @@ def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = F
             da_score=da_score,  # Hybrid Repetition (text + tool)
             do_score=do_score,
             do_type=do_type,
+            # Baseline and TRACER metrics
+            normentropy_filtered_score=normentropy_filtered_score,
+            normentropy_score=normentropy_score,
+            selfconf_score=selfconf_score,
         )
 
         # Add detailed statistics if requested
@@ -246,13 +275,34 @@ def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = F
             turn_data.statistics = stats.model_dump()
 
         uncertainty_scores.append(turn_data)
+    
+    # Calculate cumulative TRACER and SAUP at each turn (for early warning analysis)
+    for idx in range(len(uncertainty_scores)):
+        # Build step_data up to current turn (cumulative)
+        cumulative_step_data = []
+        for i in range(idx + 1):
+            turn = uncertainty_scores[i]
+            cumulative_step_data.append({
+                "ui": turn.normentropy_filtered_score,
+                "da": turn.da_score,
+                "do_agent": turn.do_score if turn.do_type == "agent_coherence" else None,
+                "do_user": turn.do_score if turn.do_type == "user_coherence" else None
+            })
+        
+        # Calculate cumulative TRACER
+        cumulative_tracer_result = calculate_tracer_score(cumulative_step_data, config)
+        uncertainty_scores[idx].tracer_score = cumulative_tracer_result['tracer_score']
+        
+        # Calculate cumulative SAUP
+        cumulative_saup_result = calculate_saup_score(cumulative_step_data, config)
+        uncertainty_scores[idx].saup_score = cumulative_saup_result['saup_score']
 
-    # Calculate TRACER aggregation score
+    # Calculate TRACER aggregation score (full trajectory)
     tracer_metrics = None
     if uncertainty_scores:
         step_data = [
             {
-                "ui": turn.ui_score,
+                "ui": turn.normentropy_filtered_score,
                 "da": turn.da_score,  # Hybrid repetition score
                 "do_agent": turn.do_score if turn.do_type == "agent_coherence" else None,
                 "do_user": turn.do_score if turn.do_type == "user_coherence" else None
@@ -270,8 +320,8 @@ def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = F
     # Calculate summary statistics
     summary = {}
     if uncertainty_scores:
-        agent_scores = [s.ui_score for s in uncertainty_scores if s.actor == "agent"]
-        user_scores = [s.ui_score for s in uncertainty_scores if s.actor == "user"]
+        agent_scores = [s.normentropy_filtered_score for s in uncertainty_scores if s.actor == "agent"]
+        user_scores = [s.normentropy_filtered_score for s in uncertainty_scores if s.actor == "user"]
         
         # Repetition and coherence metrics
         repetition_scores = [s.da_score for s in uncertainty_scores if s.da_score is not None]
@@ -281,12 +331,12 @@ def analyze_simulation(simulation: dict, config: TRACERConfig, verbose: bool = F
 
         summary = {
             "mean_uncertainty_overall": float(
-                np.mean([s.ui_score for s in uncertainty_scores])
+                np.mean([s.normentropy_filtered_score for s in uncertainty_scores])
             ),
             "mean_uncertainty_agent": float(np.mean(agent_scores)) if agent_scores else 0.0,
             "mean_uncertainty_user": float(np.mean(user_scores)) if user_scores else 0.0,
             "max_uncertainty_overall": float(
-                np.max([s.ui_score for s in uncertainty_scores])
+                np.max([s.normentropy_filtered_score for s in uncertainty_scores])
             ),
             "agent_turn_count": len(agent_scores),
             "user_turn_count": len(user_scores),
@@ -361,7 +411,7 @@ def calculate_auroc_metrics(
             # Build step_data from filtered scores
             step_data = [
                 {
-                    "ui": turn.ui_score,
+                    "ui": turn.normentropy_filtered_score,
                     "da": turn.da_score,
                     "do_agent": turn.do_score if turn.do_type == "agent_coherence" else None,
                     "do_user": turn.do_score if turn.do_type == "user_coherence" else None
@@ -496,7 +546,7 @@ def calculate_baseline_aurocs(
             if not filtered_scores:
                 continue
             
-            mean_uncertainty = float(np.mean([s.ui_score for s in filtered_scores]))
+            mean_uncertainty = float(np.mean([s.normentropy_filtered_score for s in filtered_scores]))
         else:
             # Full analysis: Use mean_uncertainty_overall (all steps), consistent with TRACER
             mean_uncertainty = sim.summary.get('mean_uncertainty_overall')
@@ -688,7 +738,7 @@ def calculate_baseline_aurocs(
                     do_user = score.do_score
             
             step_data.append({
-                'ui': score.ui_score,
+                'ui': score.normentropy_filtered_score,
                 'da': score.da_score,
                 'do_agent': do_agent,
                 'do_user': do_user
@@ -898,6 +948,185 @@ def calculate_auarc_metrics(
     except Exception as e:
         logger.error(f"Failed to calculate AUARC: {e}")
         return None
+
+
+def calculate_early_warning_metrics(
+    analyzed_sims: list[SimulationUncertainty],
+    original_results: Results = None
+) -> Optional[dict[str, EarlyWarningMetrics]]:
+    """
+    Calculate early warning metrics showing when each metric signals failure.
+    
+    This analysis aims to show that TRACER can signal failure earlier than baselines
+    by analyzing at which point in the trajectory each metric reaches its peak value.
+    
+    The algorithm:
+    1. Filter only failed simulations
+    2. For each failed simulation and each metric:
+       - Find the turn where the metric reaches its maximum value (peak)
+       - Calculate the percentage of trajectory where this peak occurs
+    3. Aggregate statistics across all failed simulations
+    
+    Args:
+        analyzed_sims: List of analyzed simulations with per-turn metrics
+        original_results: Original Results object for extracting self-assessed confidence
+        
+    Returns:
+        Dictionary mapping metric name to EarlyWarningMetrics, or None if insufficient data
+    """
+    # Filter only failed simulations
+    failed_sims = [sim for sim in analyzed_sims if sim.ground_truth_pass is False]
+    
+    if len(failed_sims) < 5:
+        logger.warning(f"Not enough failed simulations for early warning analysis ({len(failed_sims)} < 5). Skipping.")
+        return None
+    
+    logger.info(f"Analyzing early warning signals across {len(failed_sims)} failed simulations")
+    
+    results = {}
+    
+    # Helper function to find peak turn and calculate percentage
+    def find_peak_percentage(values: list[float], total_turns: int) -> Optional[float]:
+        """Find the turn where value peaks and return as percentage of trajectory."""
+        if not values or total_turns == 0:
+            return None
+        
+        # Find turn with maximum value
+        peak_turn = np.argmax(values)
+        
+        # Calculate percentage of trajectory (0-100)
+        percentage = (peak_turn / (total_turns - 1)) * 100 if total_turns > 1 else 0.0
+        
+        return float(percentage)
+    
+    #########################################################################################
+    # Metric 1: Normalized Entropy (per-turn normentropy_score - raw, before filtering)
+    #########################################################################################
+    entropy_peaks = []
+    
+    for sim in failed_sims:
+        # Extract per-turn normalized entropy (raw, before filtering)
+        # Use raw normentropy_score for baseline comparison
+        normentropy_scores = [turn.normentropy_score for turn in sim.uncertainty_scores if turn.normentropy_score is not None]
+        total_turns = len(normentropy_scores)
+        
+        if total_turns > 0:
+            peak_pct = find_peak_percentage(normentropy_scores, total_turns)
+            if peak_pct is not None:
+                entropy_peaks.append(peak_pct)
+    
+    if entropy_peaks:
+        results['normalized_entropy'] = EarlyWarningMetrics(
+            num_failed_tasks=len(entropy_peaks),
+            metric_name='Normalized Entropy',
+            mean_peak_percentage=float(np.mean(entropy_peaks)),
+            median_peak_percentage=float(np.median(entropy_peaks)),
+            std_peak_percentage=float(np.std(entropy_peaks)),
+            percent_before_20=float(np.mean([p < 20 for p in entropy_peaks]) * 100),
+            percent_before_40=float(np.mean([p < 40 for p in entropy_peaks]) * 100),
+            percent_before_60=float(np.mean([p < 60 for p in entropy_peaks]) * 100),
+            percent_before_80=float(np.mean([p < 80 for p in entropy_peaks]) * 100)
+        )
+        logger.info(f"Normalized Entropy: mean peak at {results['normalized_entropy'].mean_peak_percentage:.1f}% of trajectory")
+    
+    #########################################################################################
+    # Metric 2: Self-Assessed Confidence (from per-turn selfconf_score)
+    # NOTE: selfconf_score is CONFIDENCE (higher = more confident)
+    # We convert to UNCERTAINTY by using (1 - selfconf_score) for consistency with other metrics
+    #########################################################################################
+    confidence_peaks = []
+    
+    for sim in failed_sims:
+        # Extract per-turn self-assessed confidence and convert to uncertainty
+        # selfconf_score is confidence (0-1), so (1 - selfconf_score) is uncertainty
+        uncertainties = [1.0 - turn.selfconf_score for turn in sim.uncertainty_scores if turn.selfconf_score is not None]
+        total_turns = len(uncertainties)
+        
+        if total_turns > 0:
+            # Now we're looking at uncertainty (higher = more uncertain)
+            # Peak (maximum) uncertainty value indicates the warning signal
+            peak_pct = find_peak_percentage(uncertainties, total_turns)
+            if peak_pct is not None:
+                confidence_peaks.append(peak_pct)
+    
+    if confidence_peaks:
+        results['self_assessed_confidence'] = EarlyWarningMetrics(
+            num_failed_tasks=len(confidence_peaks),
+            metric_name='Self-Assessed Confidence',
+            mean_peak_percentage=float(np.mean(confidence_peaks)),
+            median_peak_percentage=float(np.median(confidence_peaks)),
+            std_peak_percentage=float(np.std(confidence_peaks)),
+            percent_before_20=float(np.mean([p < 20 for p in confidence_peaks]) * 100),
+            percent_before_40=float(np.mean([p < 40 for p in confidence_peaks]) * 100),
+            percent_before_60=float(np.mean([p < 60 for p in confidence_peaks]) * 100),
+            percent_before_80=float(np.mean([p < 80 for p in confidence_peaks]) * 100)
+        )
+        logger.info(f"Self-Assessed Confidence: mean peak at {results['self_assessed_confidence'].mean_peak_percentage:.1f}% of trajectory")
+    
+    #########################################################################################
+    # Metric 3: SAUP (cumulative per-turn)
+    #########################################################################################
+    saup_peaks = []
+    
+    for sim in failed_sims:
+        # Extract cumulative SAUP scores
+        saup_scores = [turn.saup_score for turn in sim.uncertainty_scores if turn.saup_score is not None]
+        total_turns = len(saup_scores)
+        
+        if total_turns > 0:
+            peak_pct = find_peak_percentage(saup_scores, total_turns)
+            if peak_pct is not None:
+                saup_peaks.append(peak_pct)
+    
+    if saup_peaks:
+        results['saup'] = EarlyWarningMetrics(
+            num_failed_tasks=len(saup_peaks),
+            metric_name='SAUP',
+            mean_peak_percentage=float(np.mean(saup_peaks)),
+            median_peak_percentage=float(np.median(saup_peaks)),
+            std_peak_percentage=float(np.std(saup_peaks)),
+            percent_before_20=float(np.mean([p < 20 for p in saup_peaks]) * 100),
+            percent_before_40=float(np.mean([p < 40 for p in saup_peaks]) * 100),
+            percent_before_60=float(np.mean([p < 60 for p in saup_peaks]) * 100),
+            percent_before_80=float(np.mean([p < 80 for p in saup_peaks]) * 100)
+        )
+        logger.info(f"SAUP: mean peak at {results['saup'].mean_peak_percentage:.1f}% of trajectory")
+    
+    #########################################################################################
+    # Metric 4: TRACER (cumulative per-turn)
+    #########################################################################################
+    tracer_peaks = []
+    
+    for sim in failed_sims:
+        # Extract cumulative TRACER scores
+        tracer_scores = [turn.tracer_score for turn in sim.uncertainty_scores if turn.tracer_score is not None]
+        total_turns = len(tracer_scores)
+        
+        if total_turns > 0:
+            peak_pct = find_peak_percentage(tracer_scores, total_turns)
+            if peak_pct is not None:
+                tracer_peaks.append(peak_pct)
+    
+    if tracer_peaks:
+        results['tracer'] = EarlyWarningMetrics(
+            num_failed_tasks=len(tracer_peaks),
+            metric_name='TRACER',
+            mean_peak_percentage=float(np.mean(tracer_peaks)),
+            median_peak_percentage=float(np.median(tracer_peaks)),
+            std_peak_percentage=float(np.std(tracer_peaks)),
+            percent_before_20=float(np.mean([p < 20 for p in tracer_peaks]) * 100),
+            percent_before_40=float(np.mean([p < 40 for p in tracer_peaks]) * 100),
+            percent_before_60=float(np.mean([p < 60 for p in tracer_peaks]) * 100),
+            percent_before_80=float(np.mean([p < 80 for p in tracer_peaks]) * 100)
+        )
+        logger.info(f"TRACER: mean peak at {results['tracer'].mean_peak_percentage:.1f}% of trajectory")
+    
+    if not results:
+        logger.warning("No early warning metrics could be calculated")
+        return None
+    
+    logger.info(f"Calculated early warning metrics for {len(results)} metric(s)")
+    return results
 
 
 def calculate_baseline_auarcs(
@@ -1133,7 +1362,7 @@ def calculate_baseline_auarcs(
                     do_user = score.do_score
             
             step_data.append({
-                'ui': score.ui_score,
+                'ui': score.normentropy_filtered_score,
                 'da': score.da_score,
                 'do_agent': do_agent,
                 'do_user': do_user
@@ -1256,6 +1485,7 @@ def analyze_results(results: Results, config: TRACERConfig, verbose: bool = Fals
     baseline_aurocs = None
     baseline_auarcs = None
     ablation_studies = None
+    early_warning_metrics = None
     
     if calculate_auroc:
         # Full analysis (default - uses all turns for TRACER, agent-only for baselines)
@@ -1267,6 +1497,10 @@ def analyze_results(results: Results, config: TRACERConfig, verbose: bool = Fals
         logger.info("Calculating AUARC metrics for selective prediction...")
         auarc_metrics = calculate_auarc_metrics(analyzed_sims)
         baseline_auarcs = calculate_baseline_auarcs(analyzed_sims, original_results=results, config=config)
+        
+        # Calculate early warning metrics
+        logger.info("Calculating early warning metrics...")
+        early_warning_metrics = calculate_early_warning_metrics(analyzed_sims, original_results=results)
         
         # Ablation studies: isolate assistant-only and user-only
         logger.info("Running ablation studies...")
@@ -1323,7 +1557,8 @@ def analyze_results(results: Results, config: TRACERConfig, verbose: bool = Fals
         auarc_metrics=auarc_metrics,
         baseline_aurocs=baseline_aurocs,
         baseline_auarcs=baseline_auarcs,
-        ablation_studies=ablation_studies
+        ablation_studies=ablation_studies,
+        early_warning_metrics=early_warning_metrics
     )
 
 
@@ -1549,9 +1784,9 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
     for sim in analysis.results:
         for score in sim.uncertainty_scores:
             if score.actor == "agent":
-                all_agent_uncertainties.append(score.ui_score)
+                all_agent_uncertainties.append(score.normentropy_filtered_score)
             else:
-                all_user_uncertainties.append(score.ui_score)
+                all_user_uncertainties.append(score.normentropy_filtered_score)
 
     if all_agent_uncertainties or all_user_uncertainties:
         console.print("[bold cyan]Overall Statistics[/bold cyan]")
@@ -1897,6 +2132,145 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
         else:
             console.print("  [yellow]⚠️  TRACER AUARC not available for comparison[/yellow]")
 
+    # Early Warning Analysis
+    if analysis.early_warning_metrics is not None and len(analysis.early_warning_metrics) > 0:
+        console.print("\n[bold cyan]Early Warning Analysis[/bold cyan]")
+        console.print("  Analyzing when each metric signals failure in failed trajectories:\n")
+        console.print("  [dim]Methodology: For each failed simulation, we find the turn where each metric[/dim]")
+        console.print("  [dim]reaches its peak value, then calculate at what percentage of the trajectory[/dim]")
+        console.print("  [dim]this occurs. Lower percentages indicate earlier warning signals.[/dim]")
+        
+        # Create comparison table
+        table = Table(show_header=True, header_style="bold cyan")
+        table.add_column("Metric", style="white", width=25)
+        table.add_column("Mean Peak\nPosition", justify="right", width=12)
+        table.add_column("Median Peak\nPosition", justify="right", width=12)
+        table.add_column("Peak Before\n20% of Traj.", justify="right", width=14)
+        table.add_column("Peak Before\n40% of Traj.", justify="right", width=14)
+        table.add_column("Peak Before\n60% of Traj.", justify="right", width=14)
+        table.add_column("Peak Before\n80% of Traj.", justify="right", width=14)
+        
+        # Define order for metrics (TRACER first, then baselines)
+        metric_order = ['tracer', 'saup', 'normalized_entropy', 'self_assessed_confidence']
+        metric_display_names = {
+            'tracer': 'TRACER',
+            'saup': 'SAUP',
+            'normalized_entropy': 'Normalized Entropy',
+            'self_assessed_confidence': 'Self-Assessed Confidence'
+        }
+        
+        # Collect data for comparison
+        metric_data = []
+        for metric_key in metric_order:
+            if metric_key in analysis.early_warning_metrics:
+                metric = analysis.early_warning_metrics[metric_key]
+                metric_data.append({
+                    'key': metric_key,
+                    'name': metric_display_names.get(metric_key, metric_key),
+                    'mean': metric.mean_peak_percentage,
+                    'median': metric.median_peak_percentage,
+                    'before_20': metric.percent_before_20,
+                    'before_40': metric.percent_before_40,
+                    'before_60': metric.percent_before_60,
+                    'before_80': metric.percent_before_80
+                })
+        
+        # Add rows to table
+        for data in metric_data:
+            # Highlight TRACER row
+            name = f"[bold]{data['name']}[/bold]" if data['key'] == 'tracer' else data['name']
+            
+            # Color code mean peak position (lower is better - earlier warning)
+            mean_val = data['mean']
+            if mean_val < 30:
+                mean_color = "green"
+            elif mean_val < 50:
+                mean_color = "yellow"
+            else:
+                mean_color = "red"
+            
+            # Color code percentages (higher is better - more tasks warned early)
+            def color_percentage(pct: float) -> str:
+                if pct > 60:
+                    return "green"
+                elif pct > 40:
+                    return "yellow"
+                else:
+                    return "red"
+            
+            mean_str = f"[{mean_color}]{mean_val:.1f}%[/{mean_color}]" if data['key'] != 'tracer' else f"[bold {mean_color}]{mean_val:.1f}%[/bold {mean_color}]"
+            median_str = f"{data['median']:.1f}%" if data['key'] != 'tracer' else f"[bold]{data['median']:.1f}%[/bold]"
+            
+            before_20_color = color_percentage(data['before_20'])
+            before_40_color = color_percentage(data['before_40'])
+            before_60_color = color_percentage(data['before_60'])
+            before_80_color = color_percentage(data['before_80'])
+            
+            before_20_str = f"[{before_20_color}]{data['before_20']:.1f}%[/{before_20_color}]" if data['key'] != 'tracer' else f"[bold {before_20_color}]{data['before_20']:.1f}%[/bold {before_20_color}]"
+            before_40_str = f"[{before_40_color}]{data['before_40']:.1f}%[/{before_40_color}]" if data['key'] != 'tracer' else f"[bold {before_40_color}]{data['before_40']:.1f}%[/bold {before_40_color}]"
+            before_60_str = f"[{before_60_color}]{data['before_60']:.1f}%[/{before_60_color}]" if data['key'] != 'tracer' else f"[bold {before_60_color}]{data['before_60']:.1f}%[/bold {before_60_color}]"
+            before_80_str = f"[{before_80_color}]{data['before_80']:.1f}%[/{before_80_color}]" if data['key'] != 'tracer' else f"[bold {before_80_color}]{data['before_80']:.1f}%[/bold {before_80_color}]"
+            
+            table.add_row(
+                name,
+                mean_str,
+                median_str,
+                before_20_str,
+                before_40_str,
+                before_60_str,
+                before_80_str
+            )
+        
+        console.print(table)
+        console.print()
+        
+        # Interpretation
+        if 'tracer' in analysis.early_warning_metrics:
+            tracer_metric = analysis.early_warning_metrics['tracer']
+            
+            # Compare TRACER against baselines
+            baseline_means = [
+                data['mean'] for data in metric_data if data['key'] != 'tracer'
+            ]
+            
+            if baseline_means:
+                best_baseline_mean = min(baseline_means)
+                best_baseline_key = next(
+                    data['key'] for data in metric_data 
+                    if data['key'] != 'tracer' and data['mean'] == best_baseline_mean
+                )
+                best_baseline_name = metric_display_names.get(best_baseline_key, best_baseline_key)
+                
+                improvement = best_baseline_mean - tracer_metric.mean_peak_percentage
+                
+                console.print(f"  [bold]Num. Failed Tasks Analyzed:[/bold] {tracer_metric.num_failed_tasks}")
+                console.print()
+                
+                if improvement > 10:
+                    console.print(f"  [green]✅ TRACER signals failure significantly earlier than baselines![/green]")
+                    console.print(f"  [green]   TRACER peaks at {tracer_metric.mean_peak_percentage:.1f}% vs. best baseline at {best_baseline_mean:.1f}%[/green]")
+                    console.print(f"  [green]   Improvement: {improvement:.1f} percentage points earlier[/green]")
+                elif improvement > 5:
+                    console.print(f"  [green]✅ TRACER signals failure earlier than baselines[/green]")
+                    console.print(f"  [green]   TRACER peaks at {tracer_metric.mean_peak_percentage:.1f}% vs. best baseline at {best_baseline_mean:.1f}%[/green]")
+                    console.print(f"  [green]   Improvement: {improvement:.1f} percentage points earlier[/green]")
+                elif improvement > 0:
+                    console.print(f"  [yellow]⚠️  TRACER shows modest improvement in early warning (+{improvement:.1f} pp)[/yellow]")
+                    console.print(f"  [yellow]   TRACER peaks at {tracer_metric.mean_peak_percentage:.1f}% vs. {best_baseline_name} at {best_baseline_mean:.1f}%[/yellow]")
+                else:
+                    console.print(f"  [red]❌ TRACER does not signal earlier than best baseline[/red]")
+                    console.print(f"  [yellow]   Best baseline: {best_baseline_name} (peaks at {best_baseline_mean:.1f}%)[/yellow]")
+                    console.print(f"  [yellow]   TRACER peaks at {tracer_metric.mean_peak_percentage:.1f}%[/yellow]")
+                
+                # Additional insights
+                console.print()
+                if tracer_metric.percent_before_20 > 50:
+                    console.print(f"  [green]🎯 TRACER provides early warning (before 20% of trajectory) in {tracer_metric.percent_before_20:.1f}% of failures[/green]")
+                elif tracer_metric.percent_before_40 > 50:
+                    console.print(f"  [yellow]🎯 TRACER provides moderate early warning (before 40% of trajectory) in {tracer_metric.percent_before_40:.1f}% of failures[/yellow]")
+                else:
+                    console.print(f"  [yellow]⚠️  TRACER warning signals tend to appear later in trajectories[/yellow]")
+
     # Ablation Studies
     if analysis.ablation_studies is not None and len(analysis.ablation_studies) > 0:
         console.print("\n[bold cyan]Ablation Studies[/bold cyan]")
@@ -2054,9 +2428,9 @@ def print_detailed_trajectory(
 
     for idx, score in enumerate(sim.uncertainty_scores):
         # Color code by uncertainty level
-        if score.ui_score < 0.1:
+        if score.normentropy_filtered_score < 0.1:
             ui_color = "green"
-        elif score.ui_score < 0.3:
+        elif score.normentropy_filtered_score < 0.3:
             ui_color = "yellow"
         else:
             ui_color = "red"
@@ -2101,7 +2475,7 @@ def print_detailed_trajectory(
         table.add_row(
             str(score.turn),
             score.actor,
-            f"[{ui_color}]{score.ui_score:.3f}[/{ui_color}]",
+            f"[{ui_color}]{score.normentropy_filtered_score:.3f}[/{ui_color}]",
             da_str,
             do_str,
             penalty_str,
