@@ -143,10 +143,15 @@ class EarlyWarningMetrics(BaseModel):
     mean_peak_percentage: float  # Mean percentage of trajectory where peak occurs
     median_peak_percentage: float  # Median percentage of trajectory where peak occurs
     std_peak_percentage: float  # Std dev of peak percentages
-    percent_before_20: float  # Percentage of tasks where metric peaks before 20% of turns
-    percent_before_40: float  # Percentage of tasks where metric peaks before 40% of turns
-    percent_before_60: float  # Percentage of tasks where metric peaks before 60% of turns
-    percent_before_80: float  # Percentage of tasks where metric peaks before 80% of turns
+    percent_before_10: float  # Percentage of tasks where metric crosses before 10% of turns
+    percent_before_20: float  # Percentage of tasks where metric crosses before 20% of turns
+    percent_before_30: float  # Percentage of tasks where metric crosses before 30% of turns
+    percent_before_40: float  # Percentage of tasks where metric crosses before 40% of turns
+    percent_before_50: float  # Percentage of tasks where metric crosses before 50% of turns
+    percent_before_60: float  # Percentage of tasks where metric crosses before 60% of turns
+    percent_before_70: float  # Percentage of tasks where metric crosses before 70% of turns
+    percent_before_80: float  # Percentage of tasks where metric crosses before 80% of turns
+    percent_before_90: float  # Percentage of tasks where metric crosses before 90% of turns
 
 
 class UncertaintyAnalysis(BaseModel):
@@ -952,24 +957,27 @@ def calculate_auarc_metrics(
 
 def calculate_early_warning_metrics(
     analyzed_sims: list[SimulationUncertainty],
-    original_results: Results = None
+    baseline_aurocs: Optional[dict] = None,
+    tracer_auroc: Optional[AUROCMetrics] = None
 ) -> Optional[dict[str, EarlyWarningMetrics]]:
     """
-    Calculate early warning metrics showing when each metric signals failure.
+    Calculate early warning metrics using threshold crossing detection.
     
-    This analysis aims to show that TRACER can signal failure earlier than baselines
-    by analyzing at which point in the trajectory each metric reaches its peak value.
+    This analysis shows when each metric first crosses its optimal failure threshold,
+    indicating early detection of problems. Uses the optimal thresholds from AUROC
+    analysis to ensure fair comparison.
     
     The algorithm:
-    1. Filter only failed simulations
+    1. Extract optimal thresholds from AUROC analysis for each metric
     2. For each failed simulation and each metric:
-       - Find the turn where the metric reaches its maximum value (peak)
-       - Calculate the percentage of trajectory where this peak occurs
+       - Find the FIRST turn where the metric crosses its threshold
+       - Calculate the percentage of trajectory where this first crossing occurs
     3. Aggregate statistics across all failed simulations
     
     Args:
         analyzed_sims: List of analyzed simulations with per-turn metrics
-        original_results: Original Results object for extracting self-assessed confidence
+        baseline_aurocs: Dictionary of baseline AUROC metrics (contains optimal thresholds)
+        tracer_auroc: TRACER AUROC metrics (contains optimal threshold)
         
     Returns:
         Dictionary mapping metric name to EarlyWarningMetrics, or None if insufficient data
@@ -981,145 +989,189 @@ def calculate_early_warning_metrics(
         logger.warning(f"Not enough failed simulations for early warning analysis ({len(failed_sims)} < 5). Skipping.")
         return None
     
-    logger.info(f"Analyzing early warning signals across {len(failed_sims)} failed simulations")
+    logger.info(f"Analyzing threshold crossing for early warning across {len(failed_sims)} failed simulations")
     
     results = {}
     
-    # Helper function to find peak turn and calculate percentage
-    def find_peak_percentage(values: list[float], total_turns: int) -> Optional[float]:
-        """Find the turn where value peaks and return as percentage of trajectory."""
+    # Helper function to find first threshold crossing and calculate percentage
+    def find_first_crossing_percentage(values: list[float], threshold: float, total_turns: int) -> Optional[float]:
+        """Find the first turn where value crosses threshold and return as percentage of trajectory."""
         if not values or total_turns == 0:
             return None
         
-        # Find turn with maximum value
-        peak_turn = np.argmax(values)
+        # Find first turn where value exceeds threshold
+        for turn_idx, value in enumerate(values):
+            if value > threshold:
+                # Calculate percentage of trajectory (0-100)
+                percentage = (turn_idx / (total_turns - 1)) * 100 if total_turns > 1 else 0.0
+                return float(percentage)
         
-        # Calculate percentage of trajectory (0-100)
-        percentage = (peak_turn / (total_turns - 1)) * 100 if total_turns > 1 else 0.0
-        
-        return float(percentage)
+        # If threshold never crossed, return 100% (signals at the very end)
+        return 100.0
     
     #########################################################################################
-    # Metric 1: Normalized Entropy (per-turn normentropy_score - raw, before filtering)
+    # Metric 1: Normalized Entropy (per-turn normentropy_score)
     #########################################################################################
-    entropy_peaks = []
-    
-    for sim in failed_sims:
-        # Extract per-turn normalized entropy (raw, before filtering)
-        # Use raw normentropy_score for baseline comparison
-        normentropy_scores = [turn.normentropy_score for turn in sim.uncertainty_scores if turn.normentropy_score is not None]
-        total_turns = len(normentropy_scores)
+    if baseline_aurocs and 'normalized_entropy' in baseline_aurocs:
+        threshold_entropy = baseline_aurocs['normalized_entropy']['optimal_threshold']
+        logger.info(f"Using Normalized Entropy threshold: {threshold_entropy:.4f}")
         
-        if total_turns > 0:
-            peak_pct = find_peak_percentage(normentropy_scores, total_turns)
-            if peak_pct is not None:
-                entropy_peaks.append(peak_pct)
-    
-    if entropy_peaks:
-        results['normalized_entropy'] = EarlyWarningMetrics(
-            num_failed_tasks=len(entropy_peaks),
-            metric_name='Normalized Entropy',
-            mean_peak_percentage=float(np.mean(entropy_peaks)),
-            median_peak_percentage=float(np.median(entropy_peaks)),
-            std_peak_percentage=float(np.std(entropy_peaks)),
-            percent_before_20=float(np.mean([p < 20 for p in entropy_peaks]) * 100),
-            percent_before_40=float(np.mean([p < 40 for p in entropy_peaks]) * 100),
-            percent_before_60=float(np.mean([p < 60 for p in entropy_peaks]) * 100),
-            percent_before_80=float(np.mean([p < 80 for p in entropy_peaks]) * 100)
-        )
-        logger.info(f"Normalized Entropy: mean peak at {results['normalized_entropy'].mean_peak_percentage:.1f}% of trajectory")
+        entropy_crossings = []
+        
+        for sim in failed_sims:
+            # Extract per-turn normalized entropy
+            normentropy_scores = [turn.normentropy_score for turn in sim.uncertainty_scores if turn.normentropy_score is not None]
+            total_turns = len(normentropy_scores)
+            
+            if total_turns > 0:
+                crossing_pct = find_first_crossing_percentage(normentropy_scores, threshold_entropy, total_turns)
+                if crossing_pct is not None:
+                    entropy_crossings.append(crossing_pct)
+        
+        if entropy_crossings:
+            results['normalized_entropy'] = EarlyWarningMetrics(
+                num_failed_tasks=len(entropy_crossings),
+                metric_name='Normalized Entropy',
+                mean_peak_percentage=float(np.mean(entropy_crossings)),
+                median_peak_percentage=float(np.median(entropy_crossings)),
+                std_peak_percentage=float(np.std(entropy_crossings)),
+                percent_before_10=float(np.mean([p < 10 for p in entropy_crossings]) * 100),
+                percent_before_20=float(np.mean([p < 20 for p in entropy_crossings]) * 100),
+                percent_before_30=float(np.mean([p < 30 for p in entropy_crossings]) * 100),
+                percent_before_40=float(np.mean([p < 40 for p in entropy_crossings]) * 100),
+                percent_before_50=float(np.mean([p < 50 for p in entropy_crossings]) * 100),
+                percent_before_60=float(np.mean([p < 60 for p in entropy_crossings]) * 100),
+                percent_before_70=float(np.mean([p < 70 for p in entropy_crossings]) * 100),
+                percent_before_80=float(np.mean([p < 80 for p in entropy_crossings]) * 100),
+                percent_before_90=float(np.mean([p < 90 for p in entropy_crossings]) * 100)
+            )
+            logger.info(f"Normalized Entropy: mean first crossing at {results['normalized_entropy'].mean_peak_percentage:.1f}% of trajectory")
+    else:
+        logger.warning("Normalized Entropy AUROC not available, skipping early warning analysis")
     
     #########################################################################################
     # Metric 2: Self-Assessed Confidence (from per-turn selfconf_score)
     # NOTE: selfconf_score is CONFIDENCE (higher = more confident)
     # We convert to UNCERTAINTY by using (1 - selfconf_score) for consistency with other metrics
     #########################################################################################
-    confidence_peaks = []
-    
-    for sim in failed_sims:
-        # Extract per-turn self-assessed confidence and convert to uncertainty
-        # selfconf_score is confidence (0-1), so (1 - selfconf_score) is uncertainty
-        uncertainties = [1.0 - turn.selfconf_score for turn in sim.uncertainty_scores if turn.selfconf_score is not None]
-        total_turns = len(uncertainties)
+    if baseline_aurocs and 'self_assessed_confidence' in baseline_aurocs:
+        # Threshold is for uncertainty (1 - confidence), already computed in AUROC
+        threshold_confidence = baseline_aurocs['self_assessed_confidence']['optimal_threshold']
+        logger.info(f"Using Self-Assessed Confidence (as uncertainty) threshold: {threshold_confidence:.4f}")
         
-        if total_turns > 0:
-            # Now we're looking at uncertainty (higher = more uncertain)
-            # Peak (maximum) uncertainty value indicates the warning signal
-            peak_pct = find_peak_percentage(uncertainties, total_turns)
-            if peak_pct is not None:
-                confidence_peaks.append(peak_pct)
-    
-    if confidence_peaks:
-        results['self_assessed_confidence'] = EarlyWarningMetrics(
-            num_failed_tasks=len(confidence_peaks),
-            metric_name='Self-Assessed Confidence',
-            mean_peak_percentage=float(np.mean(confidence_peaks)),
-            median_peak_percentage=float(np.median(confidence_peaks)),
-            std_peak_percentage=float(np.std(confidence_peaks)),
-            percent_before_20=float(np.mean([p < 20 for p in confidence_peaks]) * 100),
-            percent_before_40=float(np.mean([p < 40 for p in confidence_peaks]) * 100),
-            percent_before_60=float(np.mean([p < 60 for p in confidence_peaks]) * 100),
-            percent_before_80=float(np.mean([p < 80 for p in confidence_peaks]) * 100)
-        )
-        logger.info(f"Self-Assessed Confidence: mean peak at {results['self_assessed_confidence'].mean_peak_percentage:.1f}% of trajectory")
+        confidence_crossings = []
+        
+        for sim in failed_sims:
+            # Extract per-turn self-assessed confidence and convert to uncertainty
+            # selfconf_score is confidence (0-1), so (1 - selfconf_score) is uncertainty
+            uncertainties = [1.0 - turn.selfconf_score for turn in sim.uncertainty_scores if turn.selfconf_score is not None]
+            total_turns = len(uncertainties)
+            
+            if total_turns > 0:
+                crossing_pct = find_first_crossing_percentage(uncertainties, threshold_confidence, total_turns)
+                if crossing_pct is not None:
+                    confidence_crossings.append(crossing_pct)
+        
+        if confidence_crossings:
+            results['self_assessed_confidence'] = EarlyWarningMetrics(
+                num_failed_tasks=len(confidence_crossings),
+                metric_name='Self-Assessed Confidence',
+                mean_peak_percentage=float(np.mean(confidence_crossings)),
+                median_peak_percentage=float(np.median(confidence_crossings)),
+                std_peak_percentage=float(np.std(confidence_crossings)),
+                percent_before_10=float(np.mean([p < 10 for p in confidence_crossings]) * 100),
+                percent_before_20=float(np.mean([p < 20 for p in confidence_crossings]) * 100),
+                percent_before_30=float(np.mean([p < 30 for p in confidence_crossings]) * 100),
+                percent_before_40=float(np.mean([p < 40 for p in confidence_crossings]) * 100),
+                percent_before_50=float(np.mean([p < 50 for p in confidence_crossings]) * 100),
+                percent_before_60=float(np.mean([p < 60 for p in confidence_crossings]) * 100),
+                percent_before_70=float(np.mean([p < 70 for p in confidence_crossings]) * 100),
+                percent_before_80=float(np.mean([p < 80 for p in confidence_crossings]) * 100),
+                percent_before_90=float(np.mean([p < 90 for p in confidence_crossings]) * 100)
+            )
+            logger.info(f"Self-Assessed Confidence: mean first crossing at {results['self_assessed_confidence'].mean_peak_percentage:.1f}% of trajectory")
+    else:
+        logger.warning("Self-Assessed Confidence AUROC not available, skipping early warning analysis")
     
     #########################################################################################
     # Metric 3: SAUP (cumulative per-turn)
     #########################################################################################
-    saup_peaks = []
-    
-    for sim in failed_sims:
-        # Extract cumulative SAUP scores
-        saup_scores = [turn.saup_score for turn in sim.uncertainty_scores if turn.saup_score is not None]
-        total_turns = len(saup_scores)
+    if baseline_aurocs and 'saup' in baseline_aurocs:
+        threshold_saup = baseline_aurocs['saup']['optimal_threshold']
+        logger.info(f"Using SAUP threshold: {threshold_saup:.4f}")
         
-        if total_turns > 0:
-            peak_pct = find_peak_percentage(saup_scores, total_turns)
-            if peak_pct is not None:
-                saup_peaks.append(peak_pct)
-    
-    if saup_peaks:
-        results['saup'] = EarlyWarningMetrics(
-            num_failed_tasks=len(saup_peaks),
-            metric_name='SAUP',
-            mean_peak_percentage=float(np.mean(saup_peaks)),
-            median_peak_percentage=float(np.median(saup_peaks)),
-            std_peak_percentage=float(np.std(saup_peaks)),
-            percent_before_20=float(np.mean([p < 20 for p in saup_peaks]) * 100),
-            percent_before_40=float(np.mean([p < 40 for p in saup_peaks]) * 100),
-            percent_before_60=float(np.mean([p < 60 for p in saup_peaks]) * 100),
-            percent_before_80=float(np.mean([p < 80 for p in saup_peaks]) * 100)
-        )
-        logger.info(f"SAUP: mean peak at {results['saup'].mean_peak_percentage:.1f}% of trajectory")
+        saup_crossings = []
+        
+        for sim in failed_sims:
+            # Extract cumulative SAUP scores
+            saup_scores = [turn.saup_score for turn in sim.uncertainty_scores if turn.saup_score is not None]
+            total_turns = len(saup_scores)
+            
+            if total_turns > 0:
+                crossing_pct = find_first_crossing_percentage(saup_scores, threshold_saup, total_turns)
+                if crossing_pct is not None:
+                    saup_crossings.append(crossing_pct)
+        
+        if saup_crossings:
+            results['saup'] = EarlyWarningMetrics(
+                num_failed_tasks=len(saup_crossings),
+                metric_name='SAUP',
+                mean_peak_percentage=float(np.mean(saup_crossings)),
+                median_peak_percentage=float(np.median(saup_crossings)),
+                std_peak_percentage=float(np.std(saup_crossings)),
+                percent_before_10=float(np.mean([p < 10 for p in saup_crossings]) * 100),
+                percent_before_20=float(np.mean([p < 20 for p in saup_crossings]) * 100),
+                percent_before_30=float(np.mean([p < 30 for p in saup_crossings]) * 100),
+                percent_before_40=float(np.mean([p < 40 for p in saup_crossings]) * 100),
+                percent_before_50=float(np.mean([p < 50 for p in saup_crossings]) * 100),
+                percent_before_60=float(np.mean([p < 60 for p in saup_crossings]) * 100),
+                percent_before_70=float(np.mean([p < 70 for p in saup_crossings]) * 100),
+                percent_before_80=float(np.mean([p < 80 for p in saup_crossings]) * 100),
+                percent_before_90=float(np.mean([p < 90 for p in saup_crossings]) * 100)
+            )
+            logger.info(f"SAUP: mean first crossing at {results['saup'].mean_peak_percentage:.1f}% of trajectory")
+    else:
+        logger.warning("SAUP AUROC not available, skipping early warning analysis")
     
     #########################################################################################
     # Metric 4: TRACER (cumulative per-turn)
     #########################################################################################
-    tracer_peaks = []
-    
-    for sim in failed_sims:
-        # Extract cumulative TRACER scores
-        tracer_scores = [turn.tracer_score for turn in sim.uncertainty_scores if turn.tracer_score is not None]
-        total_turns = len(tracer_scores)
+    if tracer_auroc is not None:
+        threshold_tracer = tracer_auroc.optimal_threshold
+        logger.info(f"Using TRACER threshold: {threshold_tracer:.4f}")
         
-        if total_turns > 0:
-            peak_pct = find_peak_percentage(tracer_scores, total_turns)
-            if peak_pct is not None:
-                tracer_peaks.append(peak_pct)
-    
-    if tracer_peaks:
-        results['tracer'] = EarlyWarningMetrics(
-            num_failed_tasks=len(tracer_peaks),
-            metric_name='TRACER',
-            mean_peak_percentage=float(np.mean(tracer_peaks)),
-            median_peak_percentage=float(np.median(tracer_peaks)),
-            std_peak_percentage=float(np.std(tracer_peaks)),
-            percent_before_20=float(np.mean([p < 20 for p in tracer_peaks]) * 100),
-            percent_before_40=float(np.mean([p < 40 for p in tracer_peaks]) * 100),
-            percent_before_60=float(np.mean([p < 60 for p in tracer_peaks]) * 100),
-            percent_before_80=float(np.mean([p < 80 for p in tracer_peaks]) * 100)
-        )
-        logger.info(f"TRACER: mean peak at {results['tracer'].mean_peak_percentage:.1f}% of trajectory")
+        tracer_crossings = []
+        
+        for sim in failed_sims:
+            # Extract cumulative TRACER scores
+            tracer_scores = [turn.tracer_score for turn in sim.uncertainty_scores if turn.tracer_score is not None]
+            total_turns = len(tracer_scores)
+            
+            if total_turns > 0:
+                crossing_pct = find_first_crossing_percentage(tracer_scores, threshold_tracer, total_turns)
+                if crossing_pct is not None:
+                    tracer_crossings.append(crossing_pct)
+        
+        if tracer_crossings:
+            results['tracer'] = EarlyWarningMetrics(
+                num_failed_tasks=len(tracer_crossings),
+                metric_name='TRACER',
+                mean_peak_percentage=float(np.mean(tracer_crossings)),
+                median_peak_percentage=float(np.median(tracer_crossings)),
+                std_peak_percentage=float(np.std(tracer_crossings)),
+                percent_before_10=float(np.mean([p < 10 for p in tracer_crossings]) * 100),
+                percent_before_20=float(np.mean([p < 20 for p in tracer_crossings]) * 100),
+                percent_before_30=float(np.mean([p < 30 for p in tracer_crossings]) * 100),
+                percent_before_40=float(np.mean([p < 40 for p in tracer_crossings]) * 100),
+                percent_before_50=float(np.mean([p < 50 for p in tracer_crossings]) * 100),
+                percent_before_60=float(np.mean([p < 60 for p in tracer_crossings]) * 100),
+                percent_before_70=float(np.mean([p < 70 for p in tracer_crossings]) * 100),
+                percent_before_80=float(np.mean([p < 80 for p in tracer_crossings]) * 100),
+                percent_before_90=float(np.mean([p < 90 for p in tracer_crossings]) * 100)
+            )
+            logger.info(f"TRACER: mean first crossing at {results['tracer'].mean_peak_percentage:.1f}% of trajectory")
+    else:
+        logger.warning("TRACER AUROC not available, skipping early warning analysis")
     
     if not results:
         logger.warning("No early warning metrics could be calculated")
@@ -1498,9 +1550,13 @@ def analyze_results(results: Results, config: TRACERConfig, verbose: bool = Fals
         auarc_metrics = calculate_auarc_metrics(analyzed_sims)
         baseline_auarcs = calculate_baseline_auarcs(analyzed_sims, original_results=results, config=config)
         
-        # Calculate early warning metrics
+        # Calculate early warning metrics (requires AUROC thresholds)
         logger.info("Calculating early warning metrics...")
-        early_warning_metrics = calculate_early_warning_metrics(analyzed_sims, original_results=results)
+        early_warning_metrics = calculate_early_warning_metrics(
+            analyzed_sims, 
+            baseline_aurocs=baseline_aurocs,
+            tracer_auroc=auroc_metrics
+        )
         
         # Ablation studies: isolate assistant-only and user-only
         logger.info("Running ablation studies...")
@@ -2134,29 +2190,37 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
 
     # Early Warning Analysis
     if analysis.early_warning_metrics is not None and len(analysis.early_warning_metrics) > 0:
-        console.print("\n[bold cyan]Early Warning Analysis[/bold cyan]")
-        console.print("  Analyzing when each metric signals failure in failed trajectories:\n")
-        console.print("  [dim]Methodology: For each failed simulation, we find the turn where each metric[/dim]")
-        console.print("  [dim]reaches its peak value, then calculate at what percentage of the trajectory[/dim]")
-        console.print("  [dim]this occurs. Lower percentages indicate earlier warning signals.[/dim]")
+        console.print("\n[bold cyan]Early Warning Analysis (Threshold Crossing Detection)[/bold cyan]")
+        console.print("  Analyzing when each metric first crosses its optimal failure threshold:\n")
+        console.print("  [dim]Methodology: For each failed simulation, we find the FIRST turn where each metric[/dim]")
+        console.print("  [dim]exceeds its optimal threshold (from AUROC analysis), then calculate at what[/dim]")
+        console.print("  [dim]percentage of the trajectory this first crossing occurs.[/dim]")
+        console.print("  [dim]Lower percentages indicate earlier warning signals.[/dim]")
+        console.print("  [dim]Note: All metrics compared using their optimal discrimination thresholds.[/dim]")
+        console.print("  [dim]      Self-Assessed Confidence converted to uncertainty via (1 - confidence).[/dim]\n")
         
         # Create comparison table
         table = Table(show_header=True, header_style="bold cyan")
-        table.add_column("Metric", style="white", width=25)
-        table.add_column("Mean Peak\nPosition", justify="right", width=12)
-        table.add_column("Median Peak\nPosition", justify="right", width=12)
-        table.add_column("Peak Before\n20% of Traj.", justify="right", width=14)
-        table.add_column("Peak Before\n40% of Traj.", justify="right", width=14)
-        table.add_column("Peak Before\n60% of Traj.", justify="right", width=14)
-        table.add_column("Peak Before\n80% of Traj.", justify="right", width=14)
+        table.add_column("Metric", style="white", width=32)
+        table.add_column("Mean", justify="right", width=8)
+        table.add_column("Median", justify="right", width=8)
+        table.add_column("<10%", justify="right", width=8)
+        table.add_column("<20%", justify="right", width=8)
+        table.add_column("<30%", justify="right", width=8)
+        table.add_column("<40%", justify="right", width=8)
+        table.add_column("<50%", justify="right", width=8)
+        table.add_column("<60%", justify="right", width=8)
+        table.add_column("<70%", justify="right", width=8)
+        table.add_column("<80%", justify="right", width=8)
+        table.add_column("<90%", justify="right", width=8)
         
         # Define order for metrics (TRACER first, then baselines)
         metric_order = ['tracer', 'saup', 'normalized_entropy', 'self_assessed_confidence']
         metric_display_names = {
             'tracer': 'TRACER',
             'saup': 'SAUP',
-            'normalized_entropy': 'Normalized Entropy',
-            'self_assessed_confidence': 'Self-Assessed Confidence'
+            'normalized_entropy': 'Normalized Entropy (Cumulative)',
+            'self_assessed_confidence': 'Self-Assessed Confidence (as Uncertainty)'
         }
         
         # Collect data for comparison
@@ -2169,10 +2233,15 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                     'name': metric_display_names.get(metric_key, metric_key),
                     'mean': metric.mean_peak_percentage,
                     'median': metric.median_peak_percentage,
+                    'before_10': metric.percent_before_10,
                     'before_20': metric.percent_before_20,
+                    'before_30': metric.percent_before_30,
                     'before_40': metric.percent_before_40,
+                    'before_50': metric.percent_before_50,
                     'before_60': metric.percent_before_60,
-                    'before_80': metric.percent_before_80
+                    'before_70': metric.percent_before_70,
+                    'before_80': metric.percent_before_80,
+                    'before_90': metric.percent_before_90
                 })
         
         # Add rows to table
@@ -2180,7 +2249,7 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
             # Highlight TRACER row
             name = f"[bold]{data['name']}[/bold]" if data['key'] == 'tracer' else data['name']
             
-            # Color code mean peak position (lower is better - earlier warning)
+            # Color code mean first crossing position (lower is better - earlier warning)
             mean_val = data['mean']
             if mean_val < 30:
                 mean_color = "green"
@@ -2201,24 +2270,19 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
             mean_str = f"[{mean_color}]{mean_val:.1f}%[/{mean_color}]" if data['key'] != 'tracer' else f"[bold {mean_color}]{mean_val:.1f}%[/bold {mean_color}]"
             median_str = f"{data['median']:.1f}%" if data['key'] != 'tracer' else f"[bold]{data['median']:.1f}%[/bold]"
             
-            before_20_color = color_percentage(data['before_20'])
-            before_40_color = color_percentage(data['before_40'])
-            before_60_color = color_percentage(data['before_60'])
-            before_80_color = color_percentage(data['before_80'])
-            
-            before_20_str = f"[{before_20_color}]{data['before_20']:.1f}%[/{before_20_color}]" if data['key'] != 'tracer' else f"[bold {before_20_color}]{data['before_20']:.1f}%[/bold {before_20_color}]"
-            before_40_str = f"[{before_40_color}]{data['before_40']:.1f}%[/{before_40_color}]" if data['key'] != 'tracer' else f"[bold {before_40_color}]{data['before_40']:.1f}%[/bold {before_40_color}]"
-            before_60_str = f"[{before_60_color}]{data['before_60']:.1f}%[/{before_60_color}]" if data['key'] != 'tracer' else f"[bold {before_60_color}]{data['before_60']:.1f}%[/bold {before_60_color}]"
-            before_80_str = f"[{before_80_color}]{data['before_80']:.1f}%[/{before_80_color}]" if data['key'] != 'tracer' else f"[bold {before_80_color}]{data['before_80']:.1f}%[/bold {before_80_color}]"
+            # Generate colored strings for all percentile columns
+            percentile_strs = []
+            for pct_key in ['before_10', 'before_20', 'before_30', 'before_40', 'before_50', 'before_60', 'before_70', 'before_80', 'before_90']:
+                pct_val = data[pct_key]
+                pct_color = color_percentage(pct_val)
+                pct_str = f"[{pct_color}]{pct_val:.1f}%[/{pct_color}]" if data['key'] != 'tracer' else f"[bold {pct_color}]{pct_val:.1f}%[/bold {pct_color}]"
+                percentile_strs.append(pct_str)
             
             table.add_row(
                 name,
                 mean_str,
                 median_str,
-                before_20_str,
-                before_40_str,
-                before_60_str,
-                before_80_str
+                *percentile_strs  # Unpack all 9 percentile columns
             )
         
         console.print(table)
@@ -2248,19 +2312,19 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
                 
                 if improvement > 10:
                     console.print(f"  [green]✅ TRACER signals failure significantly earlier than baselines![/green]")
-                    console.print(f"  [green]   TRACER peaks at {tracer_metric.mean_peak_percentage:.1f}% vs. best baseline at {best_baseline_mean:.1f}%[/green]")
+                    console.print(f"  [green]   TRACER crosses threshold at {tracer_metric.mean_peak_percentage:.1f}% vs. best baseline at {best_baseline_mean:.1f}%[/green]")
                     console.print(f"  [green]   Improvement: {improvement:.1f} percentage points earlier[/green]")
                 elif improvement > 5:
                     console.print(f"  [green]✅ TRACER signals failure earlier than baselines[/green]")
-                    console.print(f"  [green]   TRACER peaks at {tracer_metric.mean_peak_percentage:.1f}% vs. best baseline at {best_baseline_mean:.1f}%[/green]")
+                    console.print(f"  [green]   TRACER crosses threshold at {tracer_metric.mean_peak_percentage:.1f}% vs. best baseline at {best_baseline_mean:.1f}%[/green]")
                     console.print(f"  [green]   Improvement: {improvement:.1f} percentage points earlier[/green]")
                 elif improvement > 0:
                     console.print(f"  [yellow]⚠️  TRACER shows modest improvement in early warning (+{improvement:.1f} pp)[/yellow]")
-                    console.print(f"  [yellow]   TRACER peaks at {tracer_metric.mean_peak_percentage:.1f}% vs. {best_baseline_name} at {best_baseline_mean:.1f}%[/yellow]")
+                    console.print(f"  [yellow]   TRACER crosses threshold at {tracer_metric.mean_peak_percentage:.1f}% vs. {best_baseline_name} at {best_baseline_mean:.1f}%[/yellow]")
                 else:
                     console.print(f"  [red]❌ TRACER does not signal earlier than best baseline[/red]")
-                    console.print(f"  [yellow]   Best baseline: {best_baseline_name} (peaks at {best_baseline_mean:.1f}%)[/yellow]")
-                    console.print(f"  [yellow]   TRACER peaks at {tracer_metric.mean_peak_percentage:.1f}%[/yellow]")
+                    console.print(f"  [yellow]   Best baseline: {best_baseline_name} (crosses at {best_baseline_mean:.1f}%)[/yellow]")
+                    console.print(f"  [yellow]   TRACER crosses threshold at {tracer_metric.mean_peak_percentage:.1f}%[/yellow]")
                 
                 # Additional insights
                 console.print()
