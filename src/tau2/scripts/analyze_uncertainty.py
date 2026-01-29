@@ -964,8 +964,7 @@ def calculate_early_warning_metrics(
     Calculate early warning metrics using threshold crossing detection.
     
     This analysis shows when each metric first crosses its optimal failure threshold,
-    indicating early detection of problems. Uses the optimal thresholds from AUROC
-    analysis to ensure fair comparison.
+    indicating early detection of problems.
     
     The algorithm:
     1. Extract optimal thresholds from AUROC analysis for each metric
@@ -1064,7 +1063,7 @@ def calculate_early_warning_metrics(
         for sim in failed_sims:
             # Extract per-turn self-assessed confidence and convert to uncertainty
             # selfconf_score is confidence (0-1), so (1 - selfconf_score) is uncertainty
-            uncertainties = [1.0 - turn.selfconf_score for turn in sim.uncertainty_scores if turn.selfconf_score is not None]
+            uncertainties = [turn.selfconf_score for turn in sim.uncertainty_scores if turn.selfconf_score is not None]
             total_turns = len(uncertainties)
             
             if total_turns > 0:
@@ -2219,8 +2218,8 @@ def print_summary(analysis: UncertaintyAnalysis, console: Console):
         metric_display_names = {
             'tracer': 'TRACER',
             'saup': 'SAUP',
-            'normalized_entropy': 'Normalized Entropy (Cumulative)',
-            'self_assessed_confidence': 'Self-Assessed Confidence (as Uncertainty)'
+            'normalized_entropy': 'Normalized Entropy',
+            'self_assessed_confidence': 'Self-Assessed Confidence'
         }
         
         # Collect data for comparison
