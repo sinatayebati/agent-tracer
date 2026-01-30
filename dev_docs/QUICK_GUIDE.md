@@ -200,6 +200,24 @@ ui = calculate_normalized_entropy(message['logprobs'])
 print(f"Uncertainty (U_i): {ui:.4f}")
 ```
 
+
+### Diagnose and optimize (ablation study)
+```bash
+# Full ablation study (all variants)
+python -m tau2.scripts.diagnose_and_optimize_tracer \
+  data/uncertainty/my_simulation_results.json
+
+# Diagnostic only (fast check)
+python -m tau2.scripts.diagnose_and_optimize_tracer \
+  data/uncertainty/my_simulation_results.json \
+  --diagnostic-only
+
+# Test specific variant
+python -m tau2.scripts.diagnose_and_optimize_tracer \
+  data/uncertainty/my_simulation_results.json \
+  --variant max
+```
+
 ### Calculate Semantic Distance Metrics
 
 ```python
