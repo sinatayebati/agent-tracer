@@ -8,6 +8,8 @@ dumps/
 dump.rdb
 *.rdg
 logs/
+figures/
+data/ablation/
 data/simulations/
 data/uncertainty/
 data/optimization/
