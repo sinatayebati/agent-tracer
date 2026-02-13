@@ -25,7 +25,7 @@
 
 TRACER is a trajectory-level uncertainty metric for dual-control agentic environments in which both the agent and the user are stochastic and the agent reasons, communicates, and uses tools.
 
-TRACER is built on top of $\tau^2$-bench at core, and contributes by introducing a novel method for capturing agent uncertainty in complex workflows.
+TRACER is built on top of the $\tau^2$-bench, and contributes by introducing a novel method for capturing agent uncertainty in complex workflows.
 
 Key contributions:
 - Content-aware surprisal highlighting significant tokens
