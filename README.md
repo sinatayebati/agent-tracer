@@ -44,7 +44,11 @@ Domains are:
 - `retail`
 - `telecom`
 
-All the information that an agent developer needs to build an agent for a domain can be accessed through the domain's API docs. See [View domain documentation](#view-domain-documentation) for more details.
+> [!NOTE]
+> The developer guide to build an agent for a domain can be accessed through the domain's API docs. See [View domain documentation](#view-domain-documentation) for more details.
+
+> [!NOTE]
+> The developer guide for TRACER specific features and uncertainty analysis can be found at [Quick guide](dev_docs/QUICK_GUIDE.md)
 
 ## Installation
 
