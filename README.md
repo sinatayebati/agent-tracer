@@ -1,41 +1,36 @@
-# $\tau^2$-Bench: Evaluating Conversational Agents in a Dual-Control Environment
+# TRACER: Trajectory Risk Aggregation for Critical Episodes in Agentic Reasoning
 
-[![python](https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=flat&logo=python&logoColor=white)](https://www.python.org)
-[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![arXiv](http://img.shields.io/badge/cs.AI-arXiv%3A2506.07982-B31B1B.svg?logo=arxiv&logoColor=red)](https://arxiv.org/abs/2506.07982)
-[![blog](https://img.shields.io/badge/blog-tau2--bench-green)](https://sierra.ai/blog/benchmarking-agents-in-collaborative-real-world-scenarios)
-[![Twitter](https://img.shields.io/twitter/url/https/twitter.com/sierra.svg?style=social&label=Follow%20%40SierraPlatform)](https://x.com/SierraPlatform/status/1932464265207889974)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?logo=linkedin&logoColor=white)](https://www.linkedin.com/posts/sierra_last-year-we-introduced-%F0%9D%9C%8F-bench-a-benchmark-activity-7338229693898231809-F8L4?utm_source=share&utm_medium=member_desktop&rcm=ACoAAAdc8goBmhEsiEo1_t_XSJbAnY4_zMfAWcE)
-[![Leaderboard](https://img.shields.io/badge/🏆_Live_Leaderboard-taubench.com-brightgreen?style=flat)](https://taubench.com)
+<p align="center">
+  <a href="https://www.python.org">
+    <img src="https://img.shields.io/badge/Python-3.10%2B-blue.svg?style=flat&logo=python&logoColor=white" alt="python">
+  </a>
+  <a href="https://github.com/astral-sh/ruff">
+    <img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json" alt="Ruff">
+  </a>
+  <a href="https://github.com/psf/black">
+    <img src="https://img.shields.io/badge/code%20style-black-000000.svg" alt="Code style: black">
+  </a>
+  <a href="https://arxiv.org/abs/2602.11409">
+    <img src="http://img.shields.io/badge/cs.AI-arXiv%3A2506.07982-B31B1B.svg?logo=arxiv&logoColor=red" alt="arXiv">
+  </a>
+</p>
 
 <div align="center">
 <img src="figs/overview.png" width="95%" alt="System Overview"><br>
-<em>Figure 1: τ²-bench allows users to interact with the agent and the environment</em>
+<em>Overview of TRACER for trajectory-level uncertainty estimation in agentic reasoning.</em>
 </div>
 
-<div align="center">
-<img src="figs/traj.png" width="95%" alt="Trajectory"><br>
-<em>Figure 2: Trajectory of a conversation between an agent and a user</em>
-</div>
-
-## 🆕 What's New
-
-### 🏆 Live Leaderboard (v0.2.0)
-The τ²-bench leaderboard is now live at **[taubench.com](https://taubench.com)**! 
-
-- **📊 Interactive Rankings**: Compare model performance across all domains
-- **📱 Mobile-Friendly**: View results on any device  
-- **🔍 Detailed Analysis**: Explore trajectories and conversation flows
-- **📥 Easy Submission**: Submit your results directly through the interface
-
-[**→ Visit the Leaderboard**](https://taubench.com) | [**→ Submit Your Results**](#leaderboard-submission)
 
 ## Overview
 
-$\tau^2$-bench implements a simulation framework for evaluating customer service agents across various domains.
+TRACER is a trajectory-level uncertainty metric for dual-control agentic environments in which both the agent and the user are stochastic and the agent reasons, communicates, and uses tools.
 
-**$\tau^2$-bench is the new iteration of the original $\tau$-bench**, featuring code fixes and an additional telecom domain.
+TRACER is built on top of the $\tau^2$-bench, and contributes by introducing a novel method for capturing agent uncertainty in complex workflows.
+
+Key contributions:
+- Content-aware surprisal highlighting significant tokens
+- Situational-awareness metrics for loops and coherence
+- Tail-risk aggregation for trajectory segments
 
 Each domain specifies:
 - a policy that the agent must follow
@@ -49,7 +44,11 @@ Domains are:
 - `retail`
 - `telecom`
 
-All the information that an agent developer needs to build an agent for a domain can be accessed through the domain's API docs. See [View domain documentation](#view-domain-documentation) for more details.
+> [!NOTE]
+> The developer guide to build an agent for a domain can be accessed through the domain's API docs. See [View domain documentation](#view-domain-documentation) for more details.
+
+> [!NOTE]
+> The developer guide for TRACER specific features and uncertainty analysis can be found at [Quick guide](dev_docs/QUICK_GUIDE.md)
 
 ## Installation
 
@@ -115,7 +114,8 @@ tau2 run \
 --agent-llm gpt-4.1 \
 --user-llm gpt-4.1 \
 --num-trials 1 \
---num-tasks 5
+--num-tasks 5 \
+--calculate-uncertainty
 ```
 
 Results will be saved in `data/tau2/simulations/`.
@@ -133,6 +133,7 @@ tau2 run \
   --num-trials <trial_count> \
   --task-ids <task_ids> \
   --max-concurrency <concurrent_sims> \
+  --calculate-uncertainty <activates tracer>
   ...
 ```
 
@@ -160,91 +161,6 @@ tau2 check-data
 ```
 This command checks if your data directory is properly configured and all required files are present.
 
-## Leaderboard Submission
-
-To submit your agent results to the τ²-bench leaderboard, you need to prepare a valid submission package that meets specific requirements.
-
-### Requirements for Valid Submissions
-
-Your trajectory runs must follow these constraints:
-
-1. **Complete domain coverage**: Include results for all three domains:
-   - `retail`
-   - `airline` 
-   - `telecom`
-
-2. **Consistent model configuration**: All trajectory files must use:
-   - The same agent LLM with identical arguments across all domains
-   - The same user simulator LLM with identical arguments across all domains
-
-3. **One result per domain**: Each domain should appear exactly once in your submission
-
-4. **All tasks completed**: Run evaluation on all tasks within each domain (don't use `--task-ids` or `--num-tasks` filters)
-
-### Preparing Your Submission
-
-#### Step 1: Run Evaluations
-First, run your agent evaluation on all domains with consistent settings:
-
-```bash
-# Example: Run complete evaluation for all domains
-tau2 run --domain retail --agent-llm gpt-4.1 --user-llm gpt-4.1 --num-trials 4 --save-to my_model_retail
-tau2 run --domain airline --agent-llm gpt-4.1 --user-llm gpt-4.1 --num-trials 4 --save-to my_model_airline  
-tau2 run --domain telecom --agent-llm gpt-4.1 --user-llm gpt-4.1 --num-trials 4 --save-to my_model_telecom
-```
-
-**Important**: Use identical `--agent-llm`, `--user-llm`, and their arguments across all runs.
-
-#### Step 2: Prepare Submission Package
-Use the submission preparation tool to create your leaderboard submission:
-
-```bash
-tau2 submit prepare data/tau2/simulations/my_model_*.json --output ./my_submission
-```
-
-This command will:
-- Verify all trajectory files are valid
-- Check that submission requirements are met
-- Compute performance metrics (Pass^k rates)
-- Prompt for required metadata (model name, organization, contact email)
-- Create a structured submission directory with:
-  - `submission.json`: Metadata and metrics
-  - `trajectories/`: Your trajectory files
-
-#### Step 3: Validate Your Submission
-Before submitting, validate your submission package:
-
-```bash
-tau2 submit validate ./my_submission
-```
-
-This will verify:
-- All required files are present
-- Trajectory files are valid
-- Domain coverage is complete
-- Model configurations are consistent
-
-### Additional Options
-
-#### Skip Verification (if needed)
-```bash
-tau2 submit prepare data/tau2/simulations/my_model_*.json --output ./my_submission --no-verify
-```
-
-#### Verify Individual Trajectory Files
-```bash
-tau2 submit verify-trajs data/tau2/simulations/my_model_*.json
-```
-
-### Submitting to the Leaderboard
-
-Once your submission package is prepared and validated:
-
-1. Review the generated `submission.json` file
-2. Follow the submission guidelines in [web/leaderboard/public/submissions/README.md](web/leaderboard/public/submissions/README.md) to create a Pull Request
-3. Keep your `trajectories/` directory for reference
-
-The leaderboard will display your model's Pass^k success rates (k=1,2,3,4) across all domains.
 
 ## Experiments
 
@@ -410,13 +326,16 @@ sequenceDiagram
 ## Citation
 
 ```bibtex
-@misc{barres2025tau2,
-      title={$\tau^2$-Bench: Evaluating Conversational Agents in a Dual-Control Environment}, 
-      author={Victor Barres and Honghua Dong and Soham Ray and Xujie Si and Karthik Narasimhan},
-      year={2025},
-      eprint={2506.07982},
+@misc{tayebati2026tracertrajectoryriskaggregation,
+      title={TRACER: Trajectory Risk Aggregation for Critical Episodes in Agentic Reasoning}, 
+      author={Sina Tayebati and Divake Kumar and Nastaran Darabi and Davide Ettori and Ranganath Krishnan and Amit Ranjan Trivedi},
+      year={2026},
+      eprint={2602.11409},
       archivePrefix={arXiv},
       primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2506.07982}, 
+      url={https://arxiv.org/abs/2602.11409}, 
 }
 ```
+
+## Acknowledgement
+This work is built on top of the [$\tau^2$-bench](https://github.com/sierra-research/tau2-bench) at core. Huge thanks for their amazing work!
