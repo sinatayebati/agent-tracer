@@ -21,23 +21,16 @@
 </div>
 
 
-## 🆕 What's New
-
-### 🏆 Live Leaderboard (v0.2.0)
-The τ²-bench leaderboard is now live at **[taubench.com](https://taubench.com)**! 
-
-- **📊 Interactive Rankings**: Compare model performance across all domains
-- **📱 Mobile-Friendly**: View results on any device  
-- **🔍 Detailed Analysis**: Explore trajectories and conversation flows
-- **📥 Easy Submission**: Submit your results directly through the interface
-
-[**→ Visit the Leaderboard**](https://taubench.com) | [**→ Submit Your Results**](#leaderboard-submission)
-
 ## Overview
 
-$\tau^2$-bench implements a simulation framework for evaluating customer service agents across various domains.
+TRACER is a trajectory-level uncertainty metric for dual-control agentic environments in which both the agent and the user are stochastic and the agent reasons, communicates, and uses tools.
 
-**$\tau^2$-bench is the new iteration of the original $\tau$-bench**, featuring code fixes and an additional telecom domain.
+TRACER is built on top of $\tau^2$-bench at core, and contributes by introducing a novel method for capturing agent uncertainty in complex workflows.
+
+Key contributions:
+- Content-aware surprisal highlighting significant tokens
+- Situational-awareness metrics for loops and coherence
+- Tail-risk aggregation for trajectory segments
 
 Each domain specifies:
 - a policy that the agent must follow
